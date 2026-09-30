@@ -48,6 +48,7 @@ function buildServer(): Server {
       lastCatalog = catalog;
       server.notification({ method: 'notifications/tools/list_changed' }).catch(() => {});
     }
+    log(`tools/list 被调用，返回 ${toolDefs.length} 个工具`);
     return {
       tools: toolDefs.map(({ handler, ...def }) => ({ ...def, description: `${def.description}\n\n${catalog}` })),
     };
@@ -68,6 +69,7 @@ function buildServer(): Server {
     log(`tools/call ${req.params.name} ${result.isError ? '返回错误' : '完成'}，耗时 ${Date.now() - start}ms`);
     return result;
   });
+  server.oninitialized = () => log('客户端初始化完成（initialize 握手成功）');
   return server;
 }
 
