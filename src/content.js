@@ -1,105 +1,104 @@
-// Content script running in world: MAIN on claude.ai
-// This means we're running in the page's JavaScript context, not the extension context
-// We can access Claude's React components but NOT extension APIs
-
-// import 'bippy';
+// Runs in the MAIN world; extension storage arrives from isolated-content.js.
 import { MCPConnection } from './mcp-connection';
 import { log, setStorage } from './utils';
 
 let mcpServers = [];
+let storageLoaded = false;
+let storageReady;
+const ready = new Promise(resolve => { storageReady = resolve; });
+const connections = new Map();
 
-// Set up a connection to a server
-function createServerConnection(server, handler) {
-  log(`[MCP Client] Creating connection to ${server.name}`);
-  
-  try {
-    // Create configuration for the MCPConnection
-    const connectionConfig = {
-      connectionType: 'sse',
-      transportType: 'stdio',
-      url: server.url,
-      command: server.command,
-      args: server.args,
-      env: server.env
-    };
-    
-    // Create the MCPConnection
-    const connection = new MCPConnection(server.name, connectionConfig);
-    
-    // Start connecting in the background
-    connection.connect(handler)
-      .then(result => {
-        log(`[MCP Client] Successfully connected to ${server.name}:`, result);
-        // Trigger an update of the injected clients to refresh with the new connection
-        // updateInjectedClients();
-      })
-      .catch(error => {
-        console.error(`[MCP Client] Failed to connect to ${server.name}:`, error);
-      });
-    
-    return connection;
-  } catch (e) {
-    console.error(`[MCP Client] Error creating connection to ${server.name}:`, e);
-    return null;
-  }
+function disconnect(name) {
+  const current = connections.get(name);
+  if (!current) return;
+  current.connection.disconnect();
+  current.port.close();
+  connections.delete(name);
 }
 
-// Listen for messages from other scripts
-window.addEventListener('message', (event) => {
-  // Log messages for debugging
-  log('[MCP Client] Received window message:', event.data);
+async function connectToMcpServer(name) {
+  await ready;
+  const server = mcpServers.find(server => server.name === name);
+  if (!server) throw new Error('Unknown MCP server: ' + name);
+  const previous = connections.get(name);
+  if (previous?.connecting) return previous.connecting;
+  disconnect(name);
 
-  // Only accept messages from the same frame
-  if (event.source !== window) {
-    return;
-  }
-  
-  // Special case: filter out our own messages
-  if (event.data && event.data.source === 'main-content') {
-    log('[MCP Client] Ignoring our own message');
-    return;
-  }
-  
-  // Process messages by type
-  if (event.data && event.data.type) {    
-    switch (event.data.type) {
-      case 'mcp-ext-storage-updated':
-        log('[MCP Client] Received storage from extension:', event.data.data);
-        setStorage(event.data.data);
-        break;
-      
-      case 'mcp-servers-updated':
-        if (Array.isArray(event.data?.data?.servers)) {
-          log('[MCP Client] Received servers from extension:', event.data.data.servers);
-          mcpServers = event.data.data.servers;
-          for(let server of mcpServers) {
-            const channel = new MessageChannel();
-            const port1 = channel.port1;
-            const port2 = channel.port2;
-            port1.onmessage = (event) => {
-              log('[MCP Client] Received message from port1:', event);
-              connection.sendRequest(event.data);
-            };
-            const handler = (message) => {
-              log('[MCP Client] Received message from server:', message);
-              port1.postMessage(message);
-            };  
-            port1.start();
-            const connection = createServerConnection(server, handler);
-            log(server, connection)
-            setTimeout(() => {  
-              window.postMessage({
-                source: 'main-content',
-                type: 'mcp-server-connected',
-                serverName: server.name
-              }, '*', [port2]);
-            }, 1000);
-          }
-        
-        } else {
-          console.warn('[MCP Client] Received malformed servers data:', event.data);
-        }
-        break;
+  const { port1, port2 } = new MessageChannel();
+  const connection = new MCPConnection(name, {
+    connectionType: 'sse', transportType: 'stdio',
+    url: server.url, command: server.command, args: server.args, env: server.env,
+  });
+  const current = { connection, port: port1 };
+  connections.set(name, current);
+  port1.onmessage = async ({ data }) => {
+    const reply = await connection.sendRequest(data);
+    if (reply?.error && data.id !== undefined) {
+      port1.postMessage({ jsonrpc: '2.0', id: data.id, error: reply.error });
+    }
+  };
+  port1.start();
+  current.connecting = (async () => {
+    try {
+      await connection.connect(message => port1.postMessage(message));
+      if (connections.get(name) !== current) throw new Error('MCP connection was replaced');
+      window.postMessage({
+        source: 'main-content', type: 'mcp-server-connected', serverName: name,
+      }, '*', [port2]);
+      log('[MCP Client] Connected to ' + name);
+    } catch (error) {
+      if (connections.get(name) === current) disconnect(name);
+      port2.close();
+      throw error;
+    } finally {
+      current.connecting = null;
+    }
+  })();
+  return current.connecting;
+}
+
+// Claude requests a new transport when its chat UI mounts again after navigation.
+// A one-time mcp-server-connected event cannot restore tools in that new UI.
+const bindings = window.claudeAppBindings ??= {};
+bindings.listMcpServers ??= async () => {
+  await ready;
+  return mcpServers.map(server => server.name);
+};
+bindings.connectToMcpServer ??= connectToMcpServer;
+
+// The RPC chat omits local MCP definitions unless this page advertises a client
+// with app bindings. Advertise the MCP-capable client interface on this page.
+// shortcut: this marker depends on Claude's private client contract; revisit when it changes.
+const userAgent = window.navigator.userAgent;
+if (!/claude(nest|gov)?[/]/i.test(userAgent)) {
+  Object.defineProperty(window.navigator, 'userAgent', {
+    configurable: true,
+    get: () => userAgent + ' Claude/0.14.0',
+  });
+}
+
+window.addEventListener('message', event => {
+  if (event.source !== window || event.data?.source !== 'isolated-content') return;
+  if (event.data.type === 'mcp-ext-storage-updated') {
+    setStorage(event.data.data);
+  } else if (event.data.type === 'mcp-servers-updated') {
+    if (!Array.isArray(event.data?.data?.servers)) return;
+    const previousNames = mcpServers.map(server => server.name);
+    mcpServers = event.data.data.servers;
+    for (const name of connections.keys()) disconnect(name);
+    const wasLoaded = storageLoaded;
+    storageLoaded = true;
+    storageReady();
+    if (wasLoaded) {
+      for (const name of new Set([...previousNames, ...mcpServers.map(server => server.name)])) {
+        window.postMessage({
+          source: 'main-content', type: 'mcp-server-auto-reconnect', serverName: name,
+        }, '*');
+      }
     }
   }
+});
+
+window.addEventListener('pagehide', () => {
+  for (const name of connections.keys()) disconnect(name);
 });

@@ -43,12 +43,12 @@ pnpm build
 - 打开 `chrome://extensions/`
 - 开启“开发者模式”
 - 点击“加载已解压的扩展程序”
-- 选择本仓库的 `dist` 目录
+- 选择本仓库的 `dist-chrome` 目录
 
 **Firefox**：
 - 打开 `about:debugging#/runtime/this-firefox`
 - 点击“临时载入附加组件”
-- 选择 `dist` 目录中的 `manifest.json`
+- 先运行 `npm run build:firefox`，再选择 `dist-firefox` 目录中的 `manifest.json`
 
 ## 使用方法
 
@@ -63,7 +63,16 @@ pnpm build
 3. 配置完成后，访问 Claude.ai 时扩展会自动连接已配置的服务器
 4. Claude 即可在对话中使用这些服务器提供的工具
 
+当前网页聊天使用 RPC 协议，扩展在 Claude 页面内提供 MCP 客户端标识和 `claudeAppBindings` 连接接口，让本地工具进入对话请求，并在切换对话时重新建立连接。这会让 Claude 页面采用桌面客户端界面；Ads 浏览器配置及其他网站的 User-Agent 不变。该兼容方式依赖 Claude 的内部接口，网页更新后可能需要再次适配，不能据此认为浏览器具备完整的原生桌面功能。
+
+更新源码后运行 `npm run build:chrome`，在 `chrome://extensions/` 重新加载扩展，再刷新 Claude 页面。验证时在新消息中要求本地 `bash` 执行 `printf MCP_CONNECTION_OK`，检查是否出现对应服务器的工具调用记录；仅连接成功或菜单出现服务器不足以确认模型能调用工具。
+
 ## 开发
+
+连接重建和客户端兼容性回归检查：
+```bash
+node --test tests/content.test.mjs
+```
 
 以热重载方式运行开发模式：
 ```bash
