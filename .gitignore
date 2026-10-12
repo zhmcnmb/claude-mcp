@@ -13,6 +13,8 @@ dist-firefox
 node_modules
 dist
 dist-ssr
+outputs/
+temp/
 
 *.local
 

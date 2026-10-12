@@ -1,6 +1,6 @@
 {
   "name": "claude-local",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Local coding MCP server for claude.ai: read/write/edit/bash + Pi-style skills discovery",
   "type": "module",
@@ -9,12 +9,24 @@
   },
   "scripts": {
     "start": "node server.ts",
-    "test": "node test.mjs"
+    "test": "node test.mjs",
+    "build:app": "node build.mjs",
+    "build:windows": "node build.mjs win-x64",
+    "build:mac": "node build.mjs macos-arm64",
+    "bundle": "node bundle.mjs",
+    "desktop": "npm run bundle && electron .",
+    "test:desktop": "npm run bundle && node desktop/test.mjs"
   },
   "engines": {
     "node": ">=22.18"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.2"
-  }
+  },
+  "devDependencies": {
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.25.12"
+  },
+  "main": "desktop/main.cjs"
 }

@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 export type SkillInfo = { name: string; description: string; path: string };
+export type AgentsFile = { path: string; content: string };
 
 /** Skill 来源目录，优先级从高到低（项目目录优先于全局）。 */
 export function skillSources(workspace: string): string[] {
@@ -13,15 +14,41 @@ export function skillSources(workspace: string): string[] {
   ];
 }
 
-/** 工作区中的项目规则文件（Pi 风格 AGENTS.md），不存在则返回 null。 */
-export async function findAgentsFile(workspace: string): Promise<string | null> {
-  const file = path.join(workspace, 'AGENTS.md');
-  try {
-    await fs.access(file);
-    return file;
-  } catch {
-    return null;
+/** 全局规则优先加载，再按根目录到工作区的顺序读取祖先规则全文。 */
+export async function loadAgentsFiles(workspace: string): Promise<AgentsFile[]> {
+  const dirs: string[] = [];
+  let dir = path.resolve(workspace);
+  for (;;) {
+    dirs.unshift(dir);
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
+  dirs.unshift(path.join(os.homedir(), '.pi', 'agent'));
+  const files: AgentsFile[] = [];
+  const seen = new Set<string>();
+  for (const source of dirs) {
+    const file = path.join(source, 'AGENTS.md');
+    try {
+      const canonical = await fs.realpath(file);
+      const key = process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+      if (seen.has(key)) continue;
+      const content = (await fs.readFile(file, 'utf8')).replace(/^\uFEFF/, '');
+      files.push({ path: file, content });
+      seen.add(key);
+    } catch (e: any) {
+      if (e?.code === 'ENOENT') continue;
+      throw new Error(`无法读取规则文件 ${file}：${e?.message ?? e}`, { cause: e });
+    }
+  }
+  return files;
+}
+
+/** AGENTS.md 是预加载的基础规则，不依赖模型调用 read。 */
+export function formatAgentsInstructions(files: AgentsFile[]): string {
+  if (files.length === 0) return '';
+  const body = files.map((file) => `规则文件: ${file.path}\n${file.content}`).join('\n\n');
+  return `以下规则适用于当前工作区，处理任务前必须遵循。规则按全局、父级、工作区顺序排列；冲突时更具体目录的规则优先。\n<project_instructions>\n${body}\n</project_instructions>`;
 }
 
 /** 解析 SKILL.md 的 YAML frontmatter（简单 key: value 行，支持折行续写），只取 name/description。 */
@@ -72,13 +99,10 @@ export async function scanSkills(workspace: string): Promise<SkillInfo[]> {
   return skills;
 }
 
-/** 注入工具描述的 catalog：让模型知道有哪些 skill / 项目规则（渐进披露，需要时自己 read）。 */
-export function formatSkillsCatalog(skills: SkillInfo[], agentsFile: string | null = null): string {
-  const skillsHeader =
+/** 注入工具描述的 skills catalog（渐进披露，需要时自己 read）。 */
+export function formatSkillsCatalog(skills: SkillInfo[]): string {
+  const header =
     '可用的本地 skills：\n当任务匹配下面某个 skill 时，先用 read 工具读取它的 SKILL.md 并遵循其中的指示。';
-  const header = agentsFile
-    ? `项目规则文件: ${agentsFile}\n该文件定义了本项目的规则，开始任何工作前先用 read 工具阅读并遵循。\n\n${skillsHeader}`
-    : skillsHeader;
   if (skills.length === 0) return `${header}\n（未发现）`;
   const lines = skills.map((s) => `- ${s.name}${s.description ? `: ${s.description}` : ''}\n  路径: ${s.path}`);
   return `${header}\n${lines.join('\n')}`;

@@ -3,22 +3,32 @@
 import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadAgentsFiles } from './skills.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const port = 18765;
-const ws = mkdtempSync(path.join(tmpdir(), 'claude-local-test-'));
+const testDir = mkdtempSync(path.join(tmpdir(), 'claude-local-test-'));
+const ws = path.join(testDir, 'project', 'workspace 中文');
+const parentRules = '# Test parent rules\nPARENT_RULE_BODY\n';
+const workspaceRules = '# Test project rules\nWORKSPACE_RULE_BODY\n';
 mkdirSync(path.join(ws, '.pi', 'skills', 'demo-skill'), { recursive: true });
 writeFileSync(
   path.join(ws, '.pi', 'skills', 'demo-skill', 'SKILL.md'),
   '---\nname: demo-skill\ndescription: Demo skill for the self-check.\n---\n# Demo\n',
 );
-writeFileSync(path.join(ws, 'AGENTS.md'), '# Test project rules\n');
+writeFileSync(path.join(testDir, 'AGENTS.md'), '\uFEFF' + parentRules);
+writeFileSync(path.join(ws, 'AGENTS.md'), workspaceRules);
 
-const child = spawn(process.execPath, [path.join(here, 'server.ts'), ws, '--port', String(port)], {
+const executable = process.env.CLAUDE_LOCAL_TEST_EXECUTABLE;
+const child = spawn(executable || process.execPath, [...(executable ? ['--server'] : [path.join(here, 'server.ts')]), ws, '--port', String(port)], {
   stdio: ['ignore', 'pipe', 'pipe'],
+});
+process.once('exit', () => {
+  child.kill();
+  rmSync(testDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 child.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
 await new Promise((resolve, reject) => {
@@ -110,7 +120,24 @@ const init = await rpc('initialize', {
 });
 assert.equal(init.result.serverInfo.name, 'claude-local');
 assert.match(init.result.instructions, /demo-skill/, 'instructions carry the skills catalog');
-assert.match(init.result.instructions, /项目规则文件: .*AGENTS\.md/, 'instructions 指向工作区 AGENTS.md');
+assert.ok(init.result.instructions.includes(parentRules), 'instructions 预加载父级规则全文并去除 BOM');
+assert.ok(init.result.instructions.includes(workspaceRules), 'instructions 预加载工作区规则全文');
+assert.ok(
+  init.result.instructions.indexOf(parentRules) < init.result.instructions.indexOf(workspaceRules),
+  '规则按父级到工作区的顺序排列',
+);
+assert.match(init.result.instructions, /<project_instructions>/, '项目规则与技能目录分开');
+assert.ok(!init.result.instructions.includes('# Demo'), '技能正文仍按需读取');
+const globalAgentsPath = path.join(homedir(), '.pi', 'agent', 'AGENTS.md');
+try {
+  const globalRules = readFileSync(globalAgentsPath, 'utf8').replace(/^\uFEFF/, '');
+  assert.ok(init.result.instructions.includes(globalRules), 'instructions 预加载 Pi 全局规则全文');
+  assert.ok(init.result.instructions.indexOf(globalRules) < init.result.instructions.indexOf(parentRules));
+  const globalFiles = await loadAgentsFiles(path.dirname(globalAgentsPath));
+  assert.equal(globalFiles.filter((file) => file.path === globalAgentsPath).length, 1, '全局和祖先规则去重');
+} catch (e) {
+  if (e.code !== 'ENOENT') throw e;
+}
 const ack = await fetch(messagesUrl, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
@@ -127,6 +154,10 @@ assert.deepEqual(
 assert.ok(
   list.result.tools.every((t) => t.description.includes('demo-skill')),
   'every tool description carries the skills catalog',
+);
+assert.ok(
+  list.result.tools.every((t) => !t.description.includes('WORKSPACE_RULE_BODY') && !t.description.includes('开始任何工作前先用 read')),
+  '工具描述只带技能目录，不重复规则正文或要求重新读取规则',
 );
 
 // --- bash ---
@@ -210,7 +241,10 @@ const bigWrite = await toolCall('write', { path: 'big.txt', content: big });
 assert.ok(!bigWrite.isError, '超过 4MB 的 Write 请求体不被拒绝');
 assert.equal(readFileSync(path.join(ws, 'big.txt'), 'utf8').length, big.length);
 
-child.kill();
-rmSync(ws, { recursive: true, force: true });
+// --- 规则文件不可读取时必须报错，不能静默跳过 ---
+const invalidRulesDir = path.join(testDir, 'invalid-rules');
+mkdirSync(path.join(invalidRulesDir, 'AGENTS.md'), { recursive: true });
+await assert.rejects(loadAgentsFiles(invalidRulesDir), /无法读取规则文件/);
+
 console.log('PASS：claude-local 端到端自检全部通过');
 process.exit(0);

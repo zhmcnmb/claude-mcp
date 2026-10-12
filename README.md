@@ -94,6 +94,47 @@ pnpm dev
 
 `local-mcp/` 提供 `claude-local`：一个给 Claude.ai 用的极简本地编码服务，工具层照搬 [pi](https://github.com/badlogic/pi-mono) 的设计——只有 `read`、`write`、`edit`、`bash` 四个工具，外加 Pi 风格的 skills 发现。不提供 `list_directory`/`git_status`/`search_files` 之类的工具：这些模型都通过 `bash` 自己完成。
 
+### 桌面图形界面（无需安装 Node）
+
+- **Windows x64**：双击 `Claude-Local-MCP-windows-x64.exe`，打开桌面窗口。
+- **macOS Apple Silicon（M 系列）**：打开 `Claude-Local-MCP-macos-arm64.dmg`，将应用拖入“应用程序”，双击启动。
+- 在窗口中选择工作区，直接修改完整 **服务 URL**（主机、端口和路径），点击 **启动服务**。例如 `http://127.0.0.1:9000/custom-mcp`。
+- 点击 **复制 URL**，粘贴到浏览器扩展的 URL 字段。修改地址后，需要同步更新扩展。
+- 点击 **停止服务** 后即可修改设置；启动成功会自动保存。运行状态、端口冲突和工具日志直接显示在窗口内。
+- 点击窗口关闭按钮后，可选 **隐藏到托盘** 或 **退出程序**，也可取消。隐藏后服务继续运行；Windows 使用右下角托盘，macOS 使用顶部菜单栏图标。右击图标可 **显示窗口** 或 **退出程序**；Windows 双击托盘图标也能恢复窗口。退出会停止服务并释放端口。
+
+桌面界面仅允许本机回环地址（`127.0.0.1`、`localhost`、`[::1]`），不需要认证即可执行的文件与命令工具不向局域网开放。设置保存在系统应用数据目录的 `claude-local/settings.json`，首次使用会读取旧版 `~/.claude-local/workspace.json` 中的工作区，无需手动删除配置。
+
+程序、窗口和托盘统一使用浏览器扩展的标志。
+
+程序内置服务运行时；`bash` 调用的 Git、Python、Node 等开发工具仍使用电脑上安装的版本。Windows 产物未做发行证书签名，macOS 使用 ad-hoc 签名，未做 Apple 开发者签名/公证。
+
+开发者构建及验证（用户日常使用无需运行命令）：
+
+```bash
+cd local-mcp
+npm ci
+npm run desktop        # 启动开发界面
+npm run test:desktop   # 实际窗口操作自检
+npm run build:windows  # Windows 便携版
+npm run build:mac      # 在 Mac 上构建 Apple Silicon DMG
+```
+
+产物位于 `outputs/claude-local/`。也可在 GitHub Actions 手动运行 **Build desktop apps**，下载对应系统的构建产物。macOS 必须在 Mac 上构建、签名和验证。
+
+**在 Mac 上构建**：先安装 Node.js >= 22.18 和 Xcode Command Line Tools（未安装时运行 `xcode-select --install`），再将当前项目完整复制到 Mac。在项目根目录运行：
+
+```bash
+cd local-mcp
+npm ci
+npm run test:desktop
+npm run build:mac
+```
+
+这会生成 `outputs/claude-local/Claude-Local-MCP-macos-arm64.dmg`，仅支持 Apple Silicon（M 系列）。构建使用本机 ad-hoc 签名；若需要面向其他用户发行，仍需 Apple Developer ID 签名及公证。
+
+### 从源码启动
+
 ```bash
 cd local-mcp
 npm install
@@ -117,7 +158,11 @@ node server.ts <工作区目录> [--port 8765] [--host 127.0.0.1]
 2. `~/.pi/agent/skills`
 3. `~/.agents/skills`
 
-如果 `<工作区>/AGENTS.md` 存在，catalog 也会指引 Claude 先读并遵循它——同样是渐进披露，文件内容不内联。
+**AGENTS.md 基础规则**
+
+服务启动时自动读取 `~/.pi/agent/AGENTS.md`，再按文件系统根目录到工作区的顺序读取各级 `AGENTS.md`，相同文件只加载一次。全文以 `<project_instructions>` 放入 MCP `initialize.instructions`，作为当前工作区的基础规则；发生冲突时，更具体目录的规则优先。规则与 skills 的按需加载分开，不再要求模型先调用 `read` 才获得规则，也不在四个工具描述中重复规则全文。规则文件不存在时跳过；存在但无法读取时启动失败，避免静默漏掉规则。
+
+修改 `AGENTS.md` 后需要重启服务并让网页重新连接。MCP 客户端是否将 `initialize.instructions` 交给模型取决于客户端实现；服务端已发送全文仍需在 Claude 网页验证实际生效。
 
 每次 `tools/list` 都会重新扫描 skills，服务运行期间新增的 skill 无需重启即可生效（catalog 变化时发送 `tools/list_changed` 通知）。
 

@@ -1,0 +1,47 @@
+name: Build desktop apps
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-15-arm64]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: local-mcp
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: local-mcp/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - if: runner.os == 'Windows'
+        run: npm run build:windows
+      - if: runner.os == 'macOS'
+        run: npm run build:mac
+      - name: Test packaged server
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            export CLAUDE_LOCAL_TEST_EXECUTABLE="$GITHUB_WORKSPACE/outputs/claude-local/win-unpacked/Claude Local MCP.exe"
+          else
+            export CLAUDE_LOCAL_TEST_EXECUTABLE="$GITHUB_WORKSPACE/outputs/claude-local/mac-arm64/Claude Local MCP.app/Contents/MacOS/Claude Local MCP"
+          fi
+          npm test
+          node desktop/test.mjs "$CLAUDE_LOCAL_TEST_EXECUTABLE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-local-${{ runner.os }}
+          path: |
+            outputs/claude-local/*.exe
+            outputs/claude-local/*.dmg
+          if-no-files-found: error

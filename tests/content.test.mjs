@@ -26,7 +26,7 @@ test('Claude can request a fresh MCP port after navigating to another conversati
   }
   // Run the real entry point with transport dependencies substituted at its imports.
   const source = readFileSync(new URL('../src/content.js', import.meta.url), 'utf8')
-    .replace(/^import .*;\n/gm, '');
+    .replace(/^import .*;\r?\n/gm, '');
   vm.runInNewContext(source, {
     window, MCPConnection: Connection, MessageChannel: Channel,
     log() {}, setStorage() {}, console, setTimeout,
@@ -80,7 +80,7 @@ test('existing native client bindings and user agent are preserved', () => {
     addEventListener() {},
   };
   const source = readFileSync(new URL('../src/content.js', import.meta.url), 'utf8')
-    .replace(/^import .*;\n/gm, '');
+    .replace(/^import .*;\r?\n/gm, '');
   vm.runInNewContext(source, { window });
   assert.equal(window.navigator.userAgent, userAgent);
   assert.equal(window.claudeAppBindings.listMcpServers, listMcpServers);
