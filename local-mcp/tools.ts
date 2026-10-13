@@ -218,7 +218,7 @@ export const toolDefs = [
   {
     name: 'bash',
     description:
-      '在工作区执行 shell 命令，返回 exitCode/stdout/stderr（尾部截断到 2000 行 / 50KB）。列目录、查找、搜索、git、构建、测试都用它。Windows 下默认 cmd.exe；在服务端设置 CLAUDE_LOCAL_SHELL 环境变量可换 bash 等其他 shell。默认超时 120 秒，最长 600 秒。',
+      '在工作区执行 shell 命令，返回 exitCode/stdout/stderr（尾部截断到 2000 行 / 50KB）。列目录、查找、搜索、git、构建、测试都用它。Windows 下默认 cmd.exe；在服务端设置 CLAUDE_LOCAL_SHELL 环境变量可换 bash 等其他 shell。支持使用 rtk 压缩状态、测试与构建输出（如 rtk git status、rtk pytest -q）。默认超时 120 秒，最长 600 秒。',
     inputSchema: {
       type: 'object',
       properties: {

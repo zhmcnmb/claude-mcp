@@ -19,6 +19,11 @@ writeFileSync(
   path.join(ws, '.pi', 'skills', 'demo-skill', 'SKILL.md'),
   '---\nname: demo-skill\ndescription: Demo skill for the self-check.\n---\n# Demo\n',
 );
+mkdirSync(path.join(ws, '.pi', 'skills', 'dingtalk-calendar'), { recursive: true });
+writeFileSync(
+  path.join(ws, '.pi', 'skills', 'dingtalk-calendar', 'SKILL.md'),
+  '---\nname: dingtalk-calendar\ndescription: 钉钉日历\n---\n',
+);
 writeFileSync(path.join(testDir, 'AGENTS.md'), '\uFEFF' + parentRules);
 writeFileSync(path.join(ws, 'AGENTS.md'), workspaceRules);
 
@@ -145,20 +150,24 @@ const ack = await fetch(messagesUrl, {
 });
 assert.equal(ack.status, 202);
 
-// --- tools/list：恰好四个工具，描述里都带 skills catalog ---
+// --- tools/list：恰好四个工具，read 集中注入规则/Ponytail/skills，其余工具不重复 ---
 const list = await rpc('tools/list', {});
 assert.deepEqual(
   list.result.tools.map((t) => t.name).sort(),
   ['bash', 'edit', 'read', 'write'],
 );
+const readTool = list.result.tools.find((t) => t.name === 'read');
+assert.ok(readTool?.description.includes('demo-skill'), 'read 工具描述携带 skills catalog');
+assert.ok(readTool?.description.includes('WORKSPACE_RULE_BODY'), 'read 工具描述集中注入工作区规则全文');
+assert.ok(!readTool?.description.includes('dingtalk-calendar'), '钉钉相关技能已成功排除');
+
+const otherTools = list.result.tools.filter((t) => t.name !== 'read');
 assert.ok(
-  list.result.tools.every((t) => t.description.includes('demo-skill')),
-  'every tool description carries the skills catalog',
+  otherTools.every((t) => !t.description.includes('demo-skill') && !t.description.includes('WORKSPACE_RULE_BODY')),
+  '其余工具保持精炼，不重复注入 skills catalog 或规则正文（避免 Token 冗余）',
 );
-assert.ok(
-  list.result.tools.every((t) => !t.description.includes('WORKSPACE_RULE_BODY') && !t.description.includes('开始任何工作前先用 read')),
-  '工具描述只带技能目录，不重复规则正文或要求重新读取规则',
-);
+const bashTool = list.result.tools.find((t) => t.name === 'bash');
+assert.ok(bashTool?.description.includes('rtk'), 'bash 工具描述携带 rtk 引导');
 
 // --- bash ---
 const echo = await toolCall('bash', { command: 'node -e "console.log(6 * 7)"' });
@@ -230,9 +239,10 @@ assert.ok(overlap.isError && /重叠/.test(overlap.content[0].text), '重叠的�
 mkdirSync(path.join(ws, '.pi', 'skills', 'late-skill'), { recursive: true });
 writeFileSync(path.join(ws, '.pi', 'skills', 'late-skill', 'SKILL.md'), '---\nname: late-skill\ndescription: Added after startup.\n---\n');
 const relist = await rpc('tools/list', {});
+const reReadTool = relist.result.tools.find((t) => t.name === 'read');
 assert.ok(
-  relist.result.tools.every((t) => t.description.includes('late-skill')),
-  'tools/list 每次调用都会重新扫描 skills',
+  reReadTool?.description.includes('late-skill'),
+  'tools/list 每次调用都会重新扫描 skills 并体现在 read 工具描述中',
 );
 
 // --- 大请求体：超过 SDK 旧 4MB 上限的 Write 也必须打通（之前会静默卡死对话） ---

@@ -4,7 +4,14 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { getWorkspace, setWorkspace, toolDefs } from './tools.ts';
-import { formatAgentsInstructions, formatSkillsCatalog, loadAgentsFiles, scanSkills, skillSources } from './skills.ts';
+import {
+  formatAgentsInstructions,
+  formatSkillsCatalog,
+  loadAgentsFiles,
+  loadPonytailInstructions,
+  scanSkills,
+  skillSources,
+} from './skills.ts';
 export async function startServer({ workspace, host = '127.0.0.1', port = 8765, endpoint = '/sse', onLog = console.error }: {
   workspace: string;
   host?: string;
@@ -18,13 +25,25 @@ export async function startServer({ workspace, host = '127.0.0.1', port = 8765, 
   setWorkspace(workspace);
   const skills = await scanSkills(getWorkspace());
   const agentsFiles = await loadAgentsFiles(getWorkspace());
+  const ponytailInstructions = await loadPonytailInstructions();
   const startupCatalog = formatSkillsCatalog(skills);
-  const startupInstructions = [formatAgentsInstructions(agentsFiles), startupCatalog].filter(Boolean).join('\n\n');
-  let lastCatalog = startupCatalog;
+  const startupInstructions = [
+    formatAgentsInstructions(agentsFiles),
+    ponytailInstructions,
+    startupCatalog,
+  ].filter(Boolean).join('\n\n');
+  let lastInstructions = startupInstructions;
 
-  /** 每次 tools/list 都重新扫描，服务运行期间新增的 skill 无需重启即可生效。 */
-  async function currentCatalog(): Promise<string> {
-    return formatSkillsCatalog(await scanSkills(getWorkspace()));
+  /** 每次 tools/list 都重新扫描，服务运行期间新增的 skill 或规则变更无需重启即可生效。 */
+  async function currentInstructions(): Promise<string> {
+    const [scannedSkills, scannedAgents, scannedPonytail] = await Promise.all([
+      scanSkills(getWorkspace()),
+      loadAgentsFiles(getWorkspace()),
+      loadPonytailInstructions(),
+    ]);
+    const catalog = formatSkillsCatalog(scannedSkills);
+    const agents = formatAgentsInstructions(scannedAgents);
+    return [agents, scannedPonytail, catalog].filter(Boolean).join('\n\n');
   }
 
   function buildServer(): Server {
@@ -33,14 +52,17 @@ export async function startServer({ workspace, host = '127.0.0.1', port = 8765, 
       { capabilities: { tools: {} }, instructions: startupInstructions },
     );
     server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const catalog = await currentCatalog();
-      if (catalog !== lastCatalog) {
-        lastCatalog = catalog;
+      const instructions = await currentInstructions();
+      if (instructions !== lastInstructions) {
+        lastInstructions = instructions;
         server.notification({ method: 'notifications/tools/list_changed' }).catch(() => {});
       }
       log(`tools/list 被调用，返回 ${toolDefs.length} 个工具`);
       return {
-        tools: toolDefs.map(({ handler, ...def }) => ({ ...def, description: `${def.description}\n\n${catalog}` })),
+        tools: toolDefs.map(({ handler, ...def }) => ({
+          ...def,
+          description: def.name === 'read' ? `${def.description}\n\n${instructions}` : def.description,
+        })),
       };
     });
     server.setRequestHandler(CallToolRequestSchema, async (req) => {

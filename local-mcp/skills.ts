@@ -5,6 +5,39 @@ import path from 'node:path';
 export type SkillInfo = { name: string; description: string; path: string };
 export type AgentsFile = { path: string; content: string };
 
+/** 排除钉钉相关技能，避免无关工具污染上下文。 */
+export function isDingtalkSkill(name: string, description: string = ''): boolean {
+  const n = name.toLowerCase();
+  return n.startsWith('dingtalk') || n.includes('钉钉') || description.includes('钉钉');
+}
+
+/** 读取 Ponytail 运行时指令（若已安装且运行模式未设为 off）。 */
+export async function loadPonytailInstructions(): Promise<string> {
+  const ponytailDir =
+    process.env.PONYTAIL_DIR ||
+    path.join(os.homedir(), '.pi', 'agent', 'git', 'github.com', 'DietrichGebert', 'ponytail');
+  const cfgPath = path.join(ponytailDir, 'hooks', 'ponytail-config.js');
+  const instPath = path.join(ponytailDir, 'hooks', 'ponytail-instructions.js');
+  try {
+    await fs.access(instPath);
+  } catch {
+    return '';
+  }
+  try {
+    const { createRequire } = await import('node:module');
+    const req = createRequire(import.meta.url);
+    const { getDefaultMode } = req(cfgPath);
+    const mode = (process.env.PONYTAIL_MODE || getDefaultMode?.() || 'full').toLowerCase();
+    if (!mode || mode === 'off') return '';
+    const { getPonytailInstructions } = req(instPath);
+    const body = getPonytailInstructions?.(mode);
+    if (!body) return '';
+    return `<ponytail_instructions mode="${mode}">\n${body.trim()}\n</ponytail_instructions>`;
+  } catch {
+    return '';
+  }
+}
+
 /** Skill 来源目录，优先级从高到低（项目目录优先于全局）。 */
 export function skillSources(workspace: string): string[] {
   return [
@@ -91,9 +124,11 @@ export async function scanSkills(workspace: string): Promise<SkillInfo[]> {
       }
       const meta = parseFrontmatter(raw);
       const name = meta.name || entry.name;
+      const description = meta.description ?? '';
+      if (isDingtalkSkill(name, description)) continue;
       if (seen.has(name)) continue;
       seen.add(name);
-      skills.push({ name, description: meta.description ?? '', path: skillFile });
+      skills.push({ name, description, path: skillFile });
     }
   }
   return skills;
