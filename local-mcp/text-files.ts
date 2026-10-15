@@ -35,6 +35,16 @@ export function encodeText(file: TextFile, text: string): Buffer {
   return Buffer.concat([file.bom, body]);
 }
 
+const ENCODING_NAMES: Record<Encoding, string> = { utf8: 'UTF-8', utf16le: 'UTF-16LE', utf16be: 'UTF-16BE', cp936: 'GBK' };
+
+/** 非默认格式（UTF-8 无 BOM、LF）才提示，供 shell 处理文本时显式指定编码。 */
+export function describeFormat(file: TextFile): string {
+  const endings = new Set(file.text.match(/\r\n|\r|\n/g));
+  const eol = endings.size > 1 ? '混合行尾' : endings.has('\r\n') ? 'CRLF' : endings.has('\r') ? 'CR' : '';
+  if (file.encoding === 'utf8' && !file.bom.length && !eol) return '';
+  return `[文件格式：${ENCODING_NAMES[file.encoding]}${file.bom.length ? ' BOM' : ''}${eol ? `，${eol}` : ''}]`;
+}
+
 export function preserveWriteEol(original: string, replacement: string): string {
   if (original === replacement) return replacement;
   const endings = new Set(original.match(/\r\n|\r|\n/g));

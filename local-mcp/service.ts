@@ -15,6 +15,15 @@ import {
   scanSkills,
   skillSources,
 } from './skills.ts';
+import type { AgentsFile } from './skills.ts';
+const RUNTIME_NOTE = '运行环境：本地 MCP 服务，不加载 Pi 的自动改写等客户端扩展；不要把其他客户端的扩展状态当作本服务已启用。';
+/** 规则按条目去重：每个 AGENTS.md、Ponytail、skills 目录各自用内容哈希标识。 */
+type ContextItem = { hash: string; text?: string; agents?: AgentsFile };
+const tokenOf = (items: ContextItem[]) => contentHash(items.map((item) => item.hash).join('\n'));
+function renderContext(items: ContextItem[]): string {
+  const files = items.flatMap((item) => item.agents ? [item.agents] : []);
+  return items.flatMap((item) => item.text ? [item.text] : item.agents === files[0] ? [formatAgentsInstructions(files)] : []).join('\n\n');
+}
 export async function startServer({ workspace, host = '127.0.0.1', port = 8765, endpoint = '/sse', shellPath, rgPath, onLog = console.error }: {
   workspace: string;
   host?: string;
@@ -32,25 +41,31 @@ export async function startServer({ workspace, host = '127.0.0.1', port = 8765, 
   const skills = await scanSkills(workspace);
   const agentsFiles = await loadAgentsFiles(workspace);
 
-  async function currentContext(directory: string) {
+  async function currentContext(directory: string): Promise<ContextItem[]> {
     const [scannedSkills, scannedAgents, scannedPonytail] = await Promise.all([
       scanSkills(workspace),
       loadAgentsFiles(directory),
       loadPonytailInstructions(),
     ]);
-    const catalog = formatSkillsCatalog(scannedSkills);
-    const agents = formatAgentsInstructions(scannedAgents);
-    const instructions = [
-      '运行环境：本地 MCP 服务，不加载 Pi 的自动改写等客户端扩展；不要把其他客户端的扩展状态当作本服务已启用。',
-      agents, scannedPonytail, catalog,
-    ].filter(Boolean).join('\n\n');
-    return { instructions, version: contentHash(instructions) };
+    const item = (text: string): ContextItem => ({ hash: contentHash(text), text });
+    return [
+      item(RUNTIME_NOTE),
+      ...scannedAgents.map((file) => ({ hash: contentHash(`${file.path}\0${file.content}`), agents: file })),
+      ...[scannedPonytail, formatSkillsCatalog(scannedSkills)].filter(Boolean).map(item),
+    ];
   }
 
   function buildServer(): Server {
     const session: ToolSession = { workspace, shell, reads: new Map() };
-    let listedVersion: string | undefined;
-    let deliveredVersion: string | undefined;
+    // 模型回传 contextVersion 才算确认，防止同批并发写入越过规则交付；已确认的规则不再重发或拦截。
+    const confirmed = new Set<string>();
+    const delivered = new Set<string>();
+    const tokens = new Map<string, string[]>();
+    const offer = (items: ContextItem[]) => {
+      const token = tokenOf(items);
+      tokens.set(token, items.map((item) => item.hash));
+      return token;
+    };
     const server = new Server(
       { name: 'claude-local', version: '0.1.0' },
       // Claude 网页不消费 initialize.instructions；正文只从工具描述和工具结果交付。
@@ -58,13 +73,13 @@ export async function startServer({ workspace, host = '127.0.0.1', port = 8765, 
     );
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       const context = await currentContext(workspace);
-      listedVersion = context.version;
-      deliveredVersion = context.version;
+      const version = offer(context);
+      for (const item of context) { confirmed.add(item.hash); delivered.add(item.hash); }
       log(`tools/list 被调用，返回 ${toolDefs.length} 个工具`);
       return {
         tools: toolDefs.map(({ handler, ...def }) => ({
           ...def,
-          description: def.name === 'read' ? `${def.description}\n\n规则版本 contextVersion: ${context.version}\n${context.instructions}` : def.name === 'bash' ? `${def.description}\n\n${shell.environment}` : def.description,
+          description: def.name === 'read' ? `${def.description}\n\n规则版本 contextVersion: ${version}\n${renderContext(context)}` : def.name === 'bash' ? `${def.description}\n\n${shell.environment}` : def.description,
         })),
       };
     });
@@ -86,18 +101,23 @@ export async function startServer({ workspace, host = '127.0.0.1', port = 8765, 
           const target = await resolveToolPath(workspace, String(def.name === 'bash' ? args.cwd ?? '.' : args.path));
           const directory = def.name === 'bash' ? target : path.dirname(target);
           const context = await currentContext(directory);
-          const contextText = `适用目录：${directory}\n规则版本 contextVersion: ${context.version}\n以下正文替代该作用域的旧版本；其他目录仍按各自范围适用。\n${context.instructions}`;
-          // 动态规则须由模型在下一次调用回传版本，防止同批并发写入越过规则交付。
-          if (def.name !== 'read' && args.contextVersion !== context.version
-            && (context.version !== listedVersion || args.contextVersion !== undefined)) {
-            deliveredVersion = context.version;
-            result = fail(`CONTEXT_REQUIRED：本次操作尚未执行。先遵循下面的规则，再携带 contextVersion 重试原操作，无需请求用户确认。\n\n${contextText}`);
-          } else {
-            const includeContext = def.name === 'read' && context.version !== deliveredVersion;
+          for (const hash of tokens.get(String(args.contextVersion)) ?? []) confirmed.add(hash);
+          const missing = context.filter((item) => !confirmed.has(item.hash));
+          if (missing.length === 0) {
             result = await def.handler(args as never, { ...session, readVersions });
-            if (includeContext) result.content.unshift({ type: 'text', text: contextText });
-            else if (def.name === 'read' && context.version !== listedVersion) result.content.push({ type: 'text', text: `适用目录：${directory}\ncontextVersion: ${context.version}` });
-            deliveredVersion = context.version;
+          } else {
+            const unseen = missing.filter((item) => !delivered.has(item.hash));
+            for (const item of missing) delivered.add(item.hash);
+            const contextText = `适用目录：${directory}\ncontextVersion: ${offer(missing)}\n${unseen.length
+              ? `以下仅列出本连接尚未确认的新增或更新规则；同一规则文件以此版本为准，已确认的其他规则继续有效。\n${renderContext(unseen)}`
+              : '适用规则已在本连接之前的工具结果中交付，尚未确认。'}`;
+            if (def.name !== 'read') {
+              result = fail(`CONTEXT_REQUIRED：本次操作尚未执行。先遵循规则，再携带 contextVersion 重试原操作，无需请求用户确认。\n\n${contextText}`);
+            } else {
+              result = await def.handler(args as never, { ...session, readVersions });
+              if (unseen.length) result.content.unshift({ type: 'text', text: contextText });
+              else result.content.push({ type: 'text', text: contextText });
+            }
           }
         } catch (e: any) {
           result = { content: [{ type: 'text' as const, text: String(e?.message ?? e) }], isError: true };

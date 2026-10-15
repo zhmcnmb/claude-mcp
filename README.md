@@ -146,15 +146,15 @@ node server.ts <工作区目录> [--port 8765] [--host 127.0.0.1] [--shell <Shel
 
 **工具**
 
-- `read(path, offset?, limit?)` — 带行号输出（`1: ...`），2000 行 / 50KB 截断；图片（png/jpg/gif/webp/bmp）返回图像内容。成功读取文本时记录本连接的文件哈希。
+- `read(path, offset?, limit?)` — 带行号输出（`1: ...`），2000 行 / 50KB 截断；非 UTF-8 或非 LF 的文件首行标注格式（如 `[文件格式：GBK，CRLF]`）；图片（png/jpg/gif/webp/bmp）返回图像内容。成功读取文本时记录本连接的文件哈希。
 - `write(path, content, contextVersion?)` — 创建（自动建父目录）或整体覆盖；缺少 `content` 会报错，明确传空字符串才表示清空。
 - `edit(path, oldText, newText, replaceAll?, contextVersion?)` 或 `edit(path, edits: [...], replaceAll?, contextVersion?)` — 精确替换，兼容 LF/CRLF。默认要求唯一匹配；`replaceAll: true` 对所有编辑项启用全部匹配替换。区域仍不得重叠，批量任一失败则全部不落盘。成功返回替换数量和第一处改动附近的行号；失败给出 0 处或多处，可能时附候选行，但不会自动模糊替换。删除时明确传 `newText: ""`。
-- `bash(command, timeout?, cwd?, encoding?, contextVersion?)` — 默认 `action: "run"`，等待命令结束。返回任务 ID、状态、退出码、输出尾部和完整日志路径。默认超时 120 秒；不再限制为 600 秒。每次默认从工作区执行，`cd` 不跨调用保持；操作其他项目请传 `cwd`。
+- `bash(command, timeout?, cwd?, encoding?, contextVersion?)` — 默认 `action: "run"`，等待命令结束。与 pi 相同，返回输出本身（stderr 以 `[stderr]` 分段）和末行 `exitCode`，异常结束时加 `status`。默认超时 120 秒；不再限制为 600 秒。每次默认从工作区执行，`cd` 不跨调用保持；操作其他项目请传 `cwd`。
 - `bash(action: "start", command, cwd?, timeout?, encoding?, contextVersion?)` — 立即返回 `jobId`，默认无超时。`bash(action: "output", jobId)` 查询最新状态和输出，`bash(action: "stop", jobId)` 结束任务，`bash(action: "list")` 找回当前服务内任务。工具数量仍是四个。
 
-任务跨网页断线和重连保留；停止或正常退出本地服务时结束运行中的进程树（Windows 使用 `taskkill /T /F`，POSIX 使用进程组）。不承诺异常崩溃后的进程回收或任务恢复，主动脱离进程树的守护进程不属于此生命周期。日志保存在 `<工作区>/temp/claude-local-jobs/<服务ID>/`，stdout/stderr 分别流式写入 UTF-8 文件，不再有 16MB 缓冲区上限；结果仅保留最近 2000 行 / 50KB，可用 `read` 按行分段读取日志。日志不会自动删除；确认不再需要后手动清理。当前服务最多同时运行 32 个任务，任务索引保留最近 200 条，服务重启后日志仍在，索引不恢复。
+任务跨网页断线和重连保留；停止或正常退出本地服务时结束运行中的进程树（Windows 使用 `taskkill /T /F`，POSIX 使用进程组）。不承诺异常崩溃后的进程回收或任务恢复，主动脱离进程树的守护进程不属于此生命周期。日志与 pi 一样按需创建：某个输出流超过 2000 行 / 50KB 时，才在 `<工作区>/temp/claude-local-jobs/<服务ID>/` 流式写入完整 UTF-8 文件，结果只保留末尾并给出 `stdoutPath`/`stderrPath`，可用 `read` 按行分段读取；未超限的输出不生成文件。已生成的日志不会自动删除。当前服务最多同时运行 32 个任务，任务索引保留最近 200 条，服务重启后日志仍在，索引不恢复。
 
-Windows 默认 `cmd.exe`，可在界面、`--shell` 或 `CLAUDE_LOCAL_SHELL` 指定 Shell。拒绝误用 `C:\Windows\System32\bash.exe`（WSL 入口）。cmd 默认先切换 UTF-8 代码页，PowerShell 配置 UTF-8 输出；Python 设置 `PYTHONIOENCODING=utf-8`。固定旧编码的程序可传 `encoding: "cp936"` 或 `"utf16le"`；按完整流解码，分块不会破坏多字节字符。同一进程混合多种编码不能可靠自动识别。
+Windows 默认 `cmd.exe`，可在界面、`--shell` 或 `CLAUDE_LOCAL_SHELL` 指定 Shell。拒绝误用 `C:\Windows\System32\bash.exe`（WSL 入口）。cmd 默认先切换 UTF-8 代码页，PowerShell 配置 UTF-8 输出、关闭 ANSI 着色，并补传最后一条原生命令的退出码（`-Command` 本身只返回 0/1）；命令环境设置 `NO_COLOR=1`，Python 设置 `PYTHONIOENCODING=utf-8`。固定旧编码的程序可传 `encoding: "cp936"` 或 `"utf16le"`；按完整流解码，分块不会破坏多字节字符。同一进程混合多种编码不能可靠自动识别。
 
 ripgrep 先使用界面/CLI 指定路径，否则检查 `PATH` 和 `~/.claude-local/bin/rg(.exe)`；找到后把其目录加入命令环境，实际路径同步给模型。程序不会自动下载可执行文件，未找到时界面明确提示配置路径。
 
@@ -178,7 +178,7 @@ ripgrep 先使用界面/CLI 指定路径，否则检查 `PATH` 和 `~/.claude-lo
 
 文件操作及新命令调用都重新检查目标文件目录（`bash` 使用 `cwd`）及其祖先规则。子目录规则只在对应目录适用；如果工作区设置为整个磁盘，访问具体项目时也会加载项目规则。规则文件不存在时跳过；存在但无法读取/解码时返回错误，不执行操作。
 
-进入新规则作用域或规则发生更新时，`read` 将正文及 `contextVersion` 附在结果中；同一连接连续使用相同版本时不重复正文。`write/edit` 和 `bash` 的 `run/start` 在动态规则版本未匹配时返回 `CONTEXT_REQUIRED`，**本次操作尚未执行**；模型遵循返回规则后，携带该版本重试，无需用户确认。旧版本不能用于修改后的规则；规则删除后返回新的适用规则集。任务查询与取消不受新规则版本阻塞。版本回传保证交付顺序，不代表模型一定理解或遵守规则。
+规则按条目去重：每个 `AGENTS.md`、Ponytail 正文和 skills 目录各自按内容哈希识别。`tools/list` 中的条目视为本连接已确认。进入包含未确认条目（新目录的规则或更新后的文件）的作用域时，只交付这些条目和对应 `contextVersion`：`read` 附在结果中，`write/edit` 和 `bash` 的 `run/start` 返回 `CONTEXT_REQUIRED`，**本次操作尚未执行**。模型遵循规则后携带该版本重试即完成确认，之后同一连接在该作用域的调用不再拦截、也不再要求回传版本；没有新规则文件的目录直接执行。已交付但未确认的条目不重复正文，只提示版本。任务查询与取消不受规则阻塞。版本回传保证交付顺序，不代表模型一定理解或遵守规则。
 
 规则、Ponytail 和 skills 会在 `tools/list` 以及工具调用时重新读取，更新不依赖网页主动刷新工具列表。Skills 正文仍按需加载。任意 shell 脚本内部的 `cd`、跨目录文件访问无法靠 `cwd` 完整推断；应主动指定操作项目的 `cwd`，并读取目标文件以获得更具体的规则。
 

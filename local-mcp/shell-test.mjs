@@ -19,7 +19,9 @@ export async function testShell(call, workspace, url) {
   const log = await fs.readFile(field(output, 'stdoutPath'), 'utf8');
   assert.equal(log, ('中文😀'.repeat(400) + '\n').repeat(5000));
   assert.ok(Buffer.byteLength(log) > 16 * 1024 * 1024);
-  assert.equal(await fs.readFile(field(output, 'stderrPath'), 'utf8'), '错误中文😀\n');
+  assert.match(output, /\[stdout 已截断：共 5000 行/);
+  assert.equal(field(output, 'stderrPath'), undefined, '未超限的输出不写日志文件');
+  assert.match(output, /\[stderr\]\n错误中文😀/);
   assert.ok(!output.includes('\ufffd'), 'UTF-8 截断不能拆分字符');
   assert.ok(Buffer.byteLength(output) < 110000, '返回内容受限，完整输出留在文件');
   assert.match(text(await call('read', { path: field(output, 'stdoutPath'), offset: 4999, limit: 2 })), /4999: 中文😀/);
@@ -73,8 +75,13 @@ export async function testShell(call, workspace, url) {
     const shell = await createShell(workspace, shellPath);
     try {
       const result = await shell.execute({ command: 'echo 中文' });
-      assert.match(result, /exitCode: 0/);
-      assert.match(await fs.readFile(field(result, 'stdoutPath'), 'utf8'), /中文/);
+      assert.match(result, /^中文\n\nexitCode: 0$/, '小输出只返回正文和退出码');
+      assert.match(await shell.execute({ command: 'node -e "process.exit(3)"' }), /exitCode: 3$/, `${shellPath} 传递原生命令退出码`);
+      if (/pwsh|powershell/i.test(shellPath)) {
+        const table = await shell.execute({ command: 'Get-Location; node -e "process.exit(2)"' });
+        assert.ok(!table.includes('\u001b'), 'PowerShell 表格不带 ANSI 着色');
+        assert.match(table, /Path[\s\S]*exitCode: 2$/, '传递退出码时不能丢弃已产生的表格输出');
+      }
       const sleeping = await shell.execute({ action: 'start', command: 'node -e "console.log(process.pid); setInterval(()=>{},1000)"' });
       const jobId = field(sleeping, 'jobId');
       await shell.close();

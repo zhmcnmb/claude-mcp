@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { applyEdits, decodeText, encodeText, preserveWriteEol } from './text-files.ts';
+import { applyEdits, decodeText, describeFormat, encodeText, preserveWriteEol } from './text-files.ts';
 import { utf8Slice } from './shell.ts';
 import type { Shell, ShellArgs } from './shell.ts';
 
@@ -101,14 +101,14 @@ async function readTool(args: { path: string; offset?: number; limit?: number },
   }
   let text: string;
   let hash: string;
+  let format: string;
   try {
     const loaded = await withFileLock(file, async () => {
       const bytes = await fs.readFile(file);
       const decoded = decodeText(bytes);
-      return { text: decoded.text, hash: contentHash(bytes) };
+      return { text: decoded.text, hash: contentHash(bytes), format: describeFormat(decoded) };
     });
-    text = loaded.text;
-    hash = loaded.hash;
+    ({ text, hash, format } = loaded);
   } catch (e: any) {
     return fail(`无法读取 ${file}：${e?.message ?? e}`);
   }
@@ -126,7 +126,7 @@ async function readTool(args: { path: string; offset?: number; limit?: number },
   }
   if (truncated) out += `\n[已截断 — 共 ${lines.length} 行，用 offset/limit 继续读取]`;
   session.reads.set(fileKey(file), hash);
-  return ok(out || '（空文件）');
+  return ok([format, out || '（空文件）'].filter(Boolean).join('\n'));
 }
 
 async function writeTool(args: { path: string; content: string }, session: ToolSession): Promise<ToolResult> {
@@ -184,7 +184,7 @@ export const toolDefs = [
   {
     name: 'read',
     description:
-      '读取文件并记录本连接的文件版本。文本支持 UTF-8、带 BOM 的 UTF-16、可无损往返的 GBK；返回带行号的输出，2000 行 / 50KB 截断，用 offset/limit 继续读取。图片返回图像内容。相对路径相对于工作区解析。若结果附带目录规则，先遵循规则，再用返回的 contextVersion 调用 write/edit/bash。',
+      '读取文件并记录本连接的文件版本。文本支持 UTF-8、带 BOM 的 UTF-16、可无损往返的 GBK；非 UTF-8/LF 时首行标注文件格式；返回带行号的输出，2000 行 / 50KB 截断，用 offset/limit 继续读取。图片返回图像内容。相对路径相对于工作区解析。若结果附带目录规则，先遵循规则，再用返回的 contextVersion 调用 write/edit/bash。',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -247,7 +247,7 @@ export const toolDefs = [
   {
     name: 'bash',
     description:
-      '执行 shell 命令。action 默认 run 等待结束（默认超时 120 秒）；长任务用 start 立即返回 jobId，默认无超时。用 list 列任务、output 获取状态和输出尾部、stop 结束进程树。任务跨网页重连保留，停止本地服务时终止。完整输出保留为 UTF-8 日志，可用 read 分段读取。cwd 默认工作区，cd 不跨调用保持；操作其他项目须传 cwd 以加载规则。优先用 rg 搜索，支持 rtk。默认输出 UTF-8，旧程序可显式指定 encoding。遇到 CONTEXT_REQUIRED 时先遵循规则，再带 contextVersion 重试。',
+      '执行 shell 命令。action 默认 run 等待结束（默认超时 120 秒）；长任务用 start 立即返回 jobId，默认无超时。用 list 列任务、output 获取状态和输出尾部、stop 结束进程树。任务跨网页重连保留，停止本地服务时终止。返回输出与末行 exitCode，stderr 单独标注；超过 2000 行 / 50KB 时只返回末尾，完整输出写入 UTF-8 日志并给出路径，可用 read 分段读取。cwd 默认工作区，cd 不跨调用保持；操作其他项目须传 cwd 以加载规则。优先用 rg 搜索，支持 rtk。默认输出 UTF-8，旧程序可显式指定 encoding。遇到 CONTEXT_REQUIRED 时先遵循规则，再带 contextVersion 重试。',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

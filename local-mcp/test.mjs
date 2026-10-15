@@ -267,16 +267,18 @@ for (const [name, args] of [
 
 // --- 原编码/BOM/行尾按字节保留，不可表示的新字符必须拒绝 ---
 const fixtures = [
-  ['utf8', Buffer.from('alpha=1\r\n中文\r\n'), Buffer.from('alpha=2\r\n中文\r\n')],
-  ['utf8-bom', Buffer.from('\ufeffalpha=1\r\n中文\r\n'), Buffer.from('\ufeffalpha=2\r\n中文\r\n')],
-  ['gbk', Buffer.from('616c7068613d310d0ad6d0cec40d0a', 'hex'), Buffer.from('616c7068613d320d0ad6d0cec40d0a', 'hex')],
-  ['utf16le', Buffer.from('\ufeffalpha=1\r\n中文\r\n', 'utf16le'), Buffer.from('\ufeffalpha=2\r\n中文\r\n', 'utf16le')],
-  ['utf16be', Buffer.from('\ufeffalpha=1\r\n中文\r\n', 'utf16le').swap16(), Buffer.from('\ufeffalpha=2\r\n中文\r\n', 'utf16le').swap16()],
+  ['utf8', Buffer.from('alpha=1\r\n中文\r\n'), Buffer.from('alpha=2\r\n中文\r\n'), 'UTF-8，CRLF'],
+  ['utf8-bom', Buffer.from('\ufeffalpha=1\r\n中文\r\n'), Buffer.from('\ufeffalpha=2\r\n中文\r\n'), 'UTF-8 BOM，CRLF'],
+  ['gbk', Buffer.from('616c7068613d310d0ad6d0cec40d0a', 'hex'), Buffer.from('616c7068613d320d0ad6d0cec40d0a', 'hex'), 'GBK，CRLF'],
+  ['utf16le', Buffer.from('\ufeffalpha=1\r\n中文\r\n', 'utf16le'), Buffer.from('\ufeffalpha=2\r\n中文\r\n', 'utf16le'), 'UTF-16LE BOM，CRLF'],
+  ['utf16be', Buffer.from('\ufeffalpha=1\r\n中文\r\n', 'utf16le').swap16(), Buffer.from('\ufeffalpha=2\r\n中文\r\n', 'utf16le').swap16(), 'UTF-16BE BOM，CRLF'],
 ];
-for (const [name, before, after] of fixtures) {
+for (const [name, before, after, format] of fixtures) {
   const file = `${name}.txt`;
   writeFileSync(path.join(ws, file), before);
-  assert.match(resultText(await toolCall('read', { path: file })), /中文/);
+  const shown = resultText(await toolCall('read', { path: file }));
+  assert.match(shown, /中文/);
+  assert.ok(shown.startsWith(`[文件格式：${format}]\n1: alpha=1`), shown);
   const result = await toolCall('edit', { path: file, oldText: 'alpha=1\n中文', newText: 'alpha=2\n中文' });
   assert.ok(!result.isError, resultText(result));
   assert.deepEqual(readFileSync(path.join(ws, file)), after, `${name} 局部编辑保留字节格式`);
@@ -295,7 +297,7 @@ for (const bytes of [Buffer.from([0xff]), Buffer.from([0xff, 0xfe, 0x61]), Buffe
 }
 const mixed = 'a=1\r\nb=2\nc=3\r\nd=4';
 writeFileSync(path.join(ws, 'mixed.txt'), mixed);
-await toolCall('read', { path: 'mixed.txt' });
+assert.match(resultText(await toolCall('read', { path: 'mixed.txt' })), /^\[文件格式：UTF-8，混合行尾\]/);
 assert.ok(!(await toolCall('edit', { path: 'mixed.txt', oldText: 'a=1', newText: 'a=9\ninsert=1' })).isError);
 assert.equal(readFileSync(path.join(ws, 'mixed.txt'), 'utf8'), 'a=9\r\ninsert=1\r\nb=2\nc=3\r\nd=4');
 assertError(await toolCall('write', { path: 'mixed.txt', content: 'all\nchanged\n' }), /混合行尾/);
@@ -373,11 +375,19 @@ writeFileSync(path.join(ws, 'nested', 'new.txt'), 'a=3\n');
 assertError(await toolCall('edit', { path: 'nested/new.txt', oldText: 'a=3', newText: 'lost', contextVersion: versionOf(updated) }), /已变化/);
 await toolCall('read', { path: 'nested/new.txt' });
 assert.ok(!(await toolCall('edit', { path: 'alias/new.txt', oldText: 'a=3', newText: 'a=4', contextVersion: versionOf(updated) })).isError, '路径别名共享真实文件的读取版本和目录规则');
-const commandArgs = { cwd: 'nested', command: 'node -e "require(\'fs\').writeFileSync(\'marker.txt\',\'ok\')"' };
-assertError(await toolCall('bash', commandArgs), /CONTEXT_REQUIRED/);
-assert.ok(!existsSync(path.join(ws, 'nested', 'marker.txt')));
-assert.match(resultText(await toolCall('bash', { ...commandArgs, contextVersion: versionOf(updated) })), /exitCode: 0/);
-assert.equal(readFileSync(path.join(ws, 'nested', 'marker.txt'), 'utf8'), 'ok');
+const commandArgs = { cwd: 'nested/deeper', command: 'node -e "require(\'fs\').writeFileSync(\'marker.txt\',\'ok\')"' };
+mkdirSync(path.join(ws, 'nested', 'deeper'));
+writeFileSync(path.join(ws, 'nested', 'deeper', 'AGENTS.md'), '# Deeper\nDEEPER_RULE\n');
+const deeperGate = await toolCall('bash', commandArgs);
+assertError(deeperGate, /CONTEXT_REQUIRED/);
+assert.match(resultText(deeperGate), /DEEPER_RULE/);
+assert.ok(!resultText(deeperGate).includes('NESTED_RULE_V2'), '只交付尚未确认的规则，不重发已确认正文');
+assert.ok(!resultText(deeperGate).includes('WORKSPACE_RULE_BODY'));
+assert.ok(!existsSync(path.join(ws, 'nested', 'deeper', 'marker.txt')));
+assert.match(resultText(await toolCall('bash', { ...commandArgs, contextVersion: versionOf(deeperGate) })), /exitCode: 0/);
+assert.equal(readFileSync(path.join(ws, 'nested', 'deeper', 'marker.txt'), 'utf8'), 'ok');
+assert.ok(!(await toolCall('bash', commandArgs)).isError, '已确认的规则不要求每次回传版本');
+assert.ok(!(await toolCall('bash', { cwd: 'sub', command: 'echo ok' })).isError, '没有新规则的目录不拦截');
 unlinkSync(nestedRules);
 const removed = await toolCall('read', { path: 'nested/new.txt' });
 assert.ok(!resultText(removed).includes('NESTED_RULE_V2'), '删除的规则不继续交付');

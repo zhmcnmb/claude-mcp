@@ -1,19 +1,22 @@
 import { spawn } from 'node:child_process';
-import { createWriteStream, promises as fs } from 'node:fs';
+import { promises as fs } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
-import { Transform } from 'node:stream';
+import { Transform, Writable } from 'node:stream';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import iconv from 'iconv-lite';
 
 export type ShellArgs = { action?: 'run' | 'start' | 'list' | 'output' | 'stop'; command?: string; cwd?: string; timeout?: number; jobId?: string; encoding?: string };
+type Stream = 'stdout' | 'stderr';
 type Job = {
   id: string; cwd: string; pid?: number; state: string; exitCode: number | null; error?: string;
-  stdout: string; stderr: string; stdoutPath: string; stderrPath: string; encoding: string;
+  stdout: string; stderr: string; lines: Record<Stream, number>; logs: Partial<Record<Stream, string>>;
   done: Promise<void>; stop?: Promise<void>; timer?: ReturnType<typeof setTimeout>;
 };
 const TAIL_BYTES = 50 * 1024;
+const TAIL_LINES = 2000;
 export function utf8Slice(text: string, maxBytes: number, tail = false): string {
   const bytes = Buffer.from(text);
   if (bytes.length <= maxBytes) return text;
@@ -23,7 +26,46 @@ export function utf8Slice(text: string, maxBytes: number, tail = false): string 
   else { while ((bytes[end] & 0xc0) === 0x80) end--; }
   return bytes.subarray(start, end).toString('utf8');
 }
-function tail(text: string): string { return utf8Slice(text, TAIL_BYTES, true).split('\n').slice(-2000).join('\n'); }
+function tail(text: string): string { return utf8Slice(text, TAIL_BYTES, true).split('\n').slice(-TAIL_LINES).join('\n'); }
+function countLines(chunk: Buffer): number {
+  let count = 0;
+  for (let i = chunk.indexOf(10); i !== -1; i = chunk.indexOf(10, i + 1)) count++;
+  return count;
+}
+
+/** 与 pi 相同：输出超过返回上限才写日志文件，小输出只留在内存。 */
+function lazyLog(file: string, opened: () => void): Writable {
+  let pending: Buffer[] = [];
+  let bytes = 0;
+  let lines = 0;
+  let handle: FileHandle | undefined;
+  return new Writable({
+    async write(chunk: Buffer, _encoding, callback) {
+      try {
+        if (!handle) {
+          pending.push(chunk);
+          bytes += chunk.length;
+          lines += countLines(chunk);
+          // 与 tail() 的截断条件一致：未落盘即表示返回内容完整。
+          if (bytes <= TAIL_BYTES && lines < TAIL_LINES) return callback();
+          await fs.mkdir(path.dirname(file), { recursive: true });
+          handle = await fs.open(file, 'wx');
+          opened();
+          chunk = Buffer.concat(pending);
+          pending = [];
+        }
+        await handle.write(chunk);
+        callback();
+      } catch (error: any) { callback(error); }
+    },
+    async final(callback) {
+      try { await handle?.close(); handle = undefined; callback(); } catch (error: any) { callback(error); }
+    },
+    destroy(error, callback) {
+      Promise.resolve(handle?.close()).catch(() => {}).then(() => callback(error));
+    },
+  });
+}
 
 async function executable(name: string): Promise<string> {
   const candidates = path.isAbsolute(name) ? [name] : (process.env.PATH ?? '').split(path.delimiter)
@@ -82,8 +124,12 @@ export async function createShell(workspace: string, shellPath?: string, rgPath?
     })();
     try { await job.stop; } catch (error) { job.stop = undefined; throw error; }
   }
-  function report(job: Job): string {
-    return `jobId: ${job.id}\nstatus: ${job.state}\nexitCode: ${job.exitCode ?? 'null'}\ncwd: ${job.cwd}\nencoding: ${job.encoding}${job.error ? `\nerror: ${job.error}` : ''}\n完整 UTF-8 日志（保留到手动清理，可用 read 分段读取）：\nstdoutPath: ${job.stdoutPath}\nstderrPath: ${job.stderrPath}\n\nstdout（最近 2000 行 / 50KB）:\n${job.stdout}\n\nstderr（最近 2000 行 / 50KB）:\n${job.stderr}`;
+  function report(job: Job, header: boolean): string {
+    const output = [job.stdout.trimEnd(), job.stderr.trimEnd() && `[stderr]\n${job.stderr.trimEnd()}`].filter(Boolean).join('\n\n') || '（无输出）';
+    const logs = (['stdout', 'stderr'] as const).flatMap((key) => job.logs[key]
+      ? [`[${key} 已截断：共 ${job.lines[key]} 行，只显示末尾 ${TAIL_LINES} 行 / 50KB；完整输出可用 read 分段读取]\n${key}Path: ${job.logs[key]}`] : []);
+    const footer = [!header && job.state !== 'exited' && `status: ${job.state}`, job.error && `error: ${job.error}`, `exitCode: ${job.exitCode ?? 'null'}`].filter(Boolean).join('\n');
+    return [header && `jobId: ${job.id}\nstatus: ${job.state}`, output, ...logs, footer].filter(Boolean).join('\n\n');
   }
   return {
     environment,
@@ -93,25 +139,26 @@ export async function createShell(workspace: string, shellPath?: string, rgPath?
       if (action === 'output' || action === 'stop') {
         const job = get(args.jobId);
         if (action === 'stop') await stop(job, 'stopped');
-        return report(job);
+        return report(job, true);
       }
       if (closing) throw new Error('服务正在停止，不能启动命令。');
       const cwd = await fs.realpath(path.resolve(workspace, args.cwd ?? '.'));
       if (!(await fs.stat(cwd)).isDirectory()) throw new Error(`cwd 不是目录：${cwd}`);
-      await fs.mkdir(logRoot, { recursive: true });
       if (closing) throw new Error('服务正在停止，不能启动命令。');
       if ([...jobs.values()].filter((j) => j.state === 'running').length >= 32) throw new Error('正在运行的任务已达 32 个，请先停止或等待任务完成。');
       // shortcut: 历史任务仅保留最近 200 条；日志持久保留，大规模使用时再增加索引与清理策略。
       for (const [id, job] of jobs) { if (jobs.size < 200) break; if (job.state !== 'running') jobs.delete(id); }
       const id = randomUUID();
       const encoding = args.encoding ?? 'utf8';
-      const job: Job = { id, cwd, state: 'running', exitCode: null, stdout: '', stderr: '', encoding, stdoutPath: path.join(logRoot, `${id}.stdout.log`), stderrPath: path.join(logRoot, `${id}.stderr.log`), done: Promise.resolve() };
+      const job: Job = { id, cwd, state: 'running', exitCode: null, stdout: '', stderr: '', lines: { stdout: 0, stderr: 0 }, logs: {}, done: Promise.resolve() };
       const command = args.command!;
       const utf8 = encoding === 'utf8';
       const shellArgs = kind === 'cmd' ? ['/d', '/s', '/c', `"${utf8 ? 'chcp 65001 >nul & ' : ''}${command}"`]
-        : kind === 'powershell' ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', `${utf8 ? '[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' : ''}${command}`]
+        // pwsh 重定向时仍输出 ANSI 表格着色；Windows PowerShell 5 没有 $PSStyle。
+        // -Command 只返回 0/1；SetShouldExit 补传原生退出码，而 exit 会丢弃尚未输出的表格。
+        : kind === 'powershell' ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', `if ($PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; ${utf8 ? '[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' : ''}${command}\nif (-not $?) { $host.SetShouldExit($(if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 })) }`]
         : ['-c', command];
-      const env = { ...process.env, ...(utf8 ? { PYTHONIOENCODING: 'utf-8' } : {}) };
+      const env = { ...process.env, NO_COLOR: '1', ...(utf8 ? { PYTHONIOENCODING: 'utf-8' } : {}) };
       // Windows 的环境变量名不区分大小写，但展开后的 JS 对象会同时保留 Path/PATH。
       if (rg) {
         for (const key of Object.keys(env)) if (key.toLowerCase() === 'path') delete env[key];
@@ -124,11 +171,11 @@ export async function createShell(workspace: string, shellPath?: string, rgPath?
         child.once('error', (error) => { job.error = error.message; });
         child.once('close', (code) => { job.exitCode = code; resolve(); });
       });
-      const capture = (stream: NodeJS.ReadableStream, key: 'stdout' | 'stderr') => pipeline(
+      const capture = (stream: NodeJS.ReadableStream, key: Stream) => pipeline(
         stream,
         iconv.decodeStream(encoding),
-        new Transform({ transform(chunk, _encoding, callback) { const text = chunk.toString('utf8'); job[key] = tail(job[key] + text); callback(null, chunk); } }),
-        createWriteStream(key === 'stdout' ? job.stdoutPath : job.stderrPath, { flags: 'wx' }),
+        new Transform({ transform(chunk: Buffer, _encoding, callback) { job.lines[key] += countLines(chunk); job[key] = tail(job[key] + chunk.toString('utf8')); callback(null, chunk); } }),
+        lazyLog(path.join(logRoot, `${id}.${key}.log`), () => { job.logs[key] = path.join(logRoot, `${id}.${key}.log`); }),
       ).catch(async (error) => {
         job.error = `日志写入失败：${error.message}`;
         // 不等待 job.done，避免与下面的日志 flush 形成环形等待。
@@ -141,7 +188,7 @@ export async function createShell(workspace: string, shellPath?: string, rgPath?
       const timeout = args.timeout ?? (action === 'run' ? 120000 : undefined);
       if (timeout) job.timer = setTimeout(() => { void stop(job, 'timed_out').catch((error) => { job.error = error.message; }); }, timeout);
       if (action === 'run') { await job.done; if (job.stop) await job.stop; }
-      return report(job);
+      return report(job, action === 'start');
     },
     async close() {
       closing = true;
