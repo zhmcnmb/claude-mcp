@@ -8,16 +8,19 @@ function render(state) {
   if (!initialized || (running && previousStatus !== 'running')) {
     $('workspace').value = state.workspace;
     $('url').value = state.url;
+    $('shellPath').value = state.shellPath;
+    $('rgPath').value = state.rgPath;
     initialized = true;
   }
   previousStatus = state.status;
   $('status').textContent = { stopped: '已停止', starting: '正在启动…', running: '运行中', stopping: '正在停止…' }[state.status];
   $('status').className = running ? 'running' : '';
-  for (const id of ['workspace', 'url', 'browse', 'start']) $(id).disabled = !stopped;
+  for (const id of ['workspace', 'url', 'shellPath', 'rgPath', 'browse', 'start']) $(id).disabled = !stopped;
   $('stop').disabled = !running;
   $('copy').disabled = !running;
   $('connection-url').textContent = state.url;
   $('saved').textContent = running ? '设置已保存' : '修改设置后点击启动服务';
+  $('environment').textContent = state.environment || '启动后显示实际 Shell 和 ripgrep 路径。';
   $('logs').textContent = state.logs.join('\n') || '服务尚未启动。';
   $('logs').scrollTop = $('logs').scrollHeight;
 }
@@ -35,7 +38,7 @@ $('browse').addEventListener('click', async () => {
   const folder = await action(() => window.desktop.chooseWorkspace());
   if (folder) $('workspace').value = folder;
 });
-$('start').addEventListener('click', () => action(() => window.desktop.start({ workspace: $('workspace').value, url: $('url').value })));
+$('start').addEventListener('click', () => action(() => window.desktop.start({ workspace: $('workspace').value, url: $('url').value, shellPath: $('shellPath').value, rgPath: $('rgPath').value })));
 $('stop').addEventListener('click', () => action(() => window.desktop.stop()));
 $('copy').addEventListener('click', async () => {
   const result = await window.desktop.copyUrl();

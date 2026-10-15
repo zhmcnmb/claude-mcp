@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { mkdir, readFile } = require('node:fs/promises');
+const { mkdir, readFile, lstat } = require('node:fs/promises');
 const path = require('node:path');
 const net = require('node:net');
 const { clipboard } = require('electron');
@@ -18,6 +18,7 @@ module.exports = async ({ window, configFile, tray, trayMenu, onReadyToQuit }) =
     const previous = JSON.parse(await readFile(configFile, 'utf8'));
     assert.equal(await evaluate('document.getElementById("workspace").value'), previous.workspace);
     assert.equal(await evaluate('document.getElementById("url").value'), previous.url);
+    assert.equal(await evaluate('document.getElementById("shellPath").value'), previous.shellPath);
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
   assert.equal(await evaluate('typeof require'), 'undefined', 'renderer cannot access Node');
   assert.equal(await evaluate('typeof window.desktop.start'), 'function', 'sandbox preload is connected');
@@ -50,14 +51,27 @@ module.exports = async ({ window, configFile, tray, trayMenu, onReadyToQuit }) =
     assert.match(await evaluate('document.getElementById("error").textContent'), /已被占用/);
   } finally { await new Promise((resolve) => occupied.close(resolve)); }
 
+  await input('shellPath', path.join(workspace, 'missing-shell.exe'));
+  await click('start');
+  await waitFor('!document.getElementById("error").hidden');
+  assert.match(await evaluate('document.getElementById("error").textContent'), /找不到可执行文件/);
+  const alias = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WindowsApps', 'pwsh.exe');
+  const shellPath = process.platform === 'win32' ? (alias && await lstat(alias).catch(() => null) ? alias : 'powershell.exe') : '/bin/sh';
+  await input('shellPath', shellPath);
+  await input('rgPath', path.join(workspace, 'missing-rg.exe'));
+  await click('start');
+  await waitFor('!document.getElementById("error").hidden');
+  assert.match(await evaluate('document.getElementById("error").textContent'), /找不到可执行文件/);
+  await input('rgPath', '');
   await click('start');
   await waitFor('document.getElementById("status").textContent === "运行中"');
   assert.equal(await evaluate('document.getElementById("url").disabled'), true);
   await click('copy');
   await waitFor('document.getElementById("copy").textContent === "已复制"');
   assert.equal(await clipboard.readText(), url);
+  assert.match(await evaluate('document.getElementById("environment").textContent'), /Shell:.*[\s\S]*ripgrep:/);
   const saved = JSON.parse(await readFile(configFile, 'utf8'));
-  assert.deepEqual(saved, { workspace, url });
+  assert.deepEqual(saved, { workspace, url, shellPath, rgPath: '' });
   const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
   assert.equal(response.status, 200);
   const reader = response.body.getReader();

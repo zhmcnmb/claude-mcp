@@ -33,3 +33,7 @@ dialog { max-width: min(460px, calc(100vw - 40px)); border: 1px solid #dbe2ec; b
 dialog::backdrop { background: #18263c66; }
 dialog h2 { font-size: 18px; margin-bottom: 12px; }
 @media (max-width: 700px) { main { padding: 22px; } .connection { align-items: flex-start; } }
+
+.shell-settings { margin-top: 20px; }
+.shell-settings label:not(:first-child) { margin-top: 16px; }
+#environment { white-space: pre-wrap; overflow-wrap: anywhere; }

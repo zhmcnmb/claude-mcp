@@ -1,9 +1,10 @@
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { decodeText } from './text-files.ts';
 
 export type SkillInfo = { name: string; description: string; path: string };
-export type AgentsFile = { path: string; content: string };
+export type AgentsFile = { path: string; content: string; isGlobal: boolean };
 
 /** 排除钉钉相关技能，避免无关工具污染上下文。 */
 export function isDingtalkSkill(name: string, description: string = ''): boolean {
@@ -25,7 +26,9 @@ export async function loadPonytailInstructions(): Promise<string> {
   }
   try {
     const { createRequire } = await import('node:module');
-    const req = createRequire(import.meta.url);
+    const req = createRequire(cfgPath);
+    delete req.cache[req.resolve(cfgPath)];
+    delete req.cache[req.resolve(instPath)];
     const { getDefaultMode } = req(cfgPath);
     const mode = (process.env.PONYTAIL_MODE || getDefaultMode?.() || 'full').toLowerCase();
     if (!mode || mode === 'off') return '';
@@ -57,7 +60,8 @@ export async function loadAgentsFiles(workspace: string): Promise<AgentsFile[]> 
     if (parent === dir) break;
     dir = parent;
   }
-  dirs.unshift(path.join(os.homedir(), '.pi', 'agent'));
+  const globalDirectory = path.join(os.homedir(), '.pi', 'agent');
+  dirs.unshift(globalDirectory);
   const files: AgentsFile[] = [];
   const seen = new Set<string>();
   for (const source of dirs) {
@@ -66,8 +70,8 @@ export async function loadAgentsFiles(workspace: string): Promise<AgentsFile[]> 
       const canonical = await fs.realpath(file);
       const key = process.platform === 'win32' ? canonical.toLowerCase() : canonical;
       if (seen.has(key)) continue;
-      const content = (await fs.readFile(file, 'utf8')).replace(/^\uFEFF/, '');
-      files.push({ path: file, content });
+      const content = decodeText(await fs.readFile(file)).text;
+      files.push({ path: canonical, content, isGlobal: source === globalDirectory });
       seen.add(key);
     } catch (e: any) {
       if (e?.code === 'ENOENT') continue;
@@ -80,8 +84,10 @@ export async function loadAgentsFiles(workspace: string): Promise<AgentsFile[]> 
 /** AGENTS.md 是预加载的基础规则，不依赖模型调用 read。 */
 export function formatAgentsInstructions(files: AgentsFile[]): string {
   if (files.length === 0) return '';
-  const body = files.map((file) => `规则文件: ${file.path}\n${file.content}`).join('\n\n');
-  return `以下规则适用于当前工作区，处理任务前必须遵循。规则按全局、父级、工作区顺序排列；冲突时更具体目录的规则优先。\n<project_instructions>\n${body}\n</project_instructions>`;
+  const body = files.map((file) => {
+    return `规则文件: ${file.path}\n作用范围: ${file.isGlobal ? '个人通用规则' : path.dirname(file.path) + ' 及其子目录'}\n${file.content}`;
+  }).join('\n\n');
+  return `处理任务前必须遵循适用的规则。规则按全局、父级、目标目录顺序排列；冲突时更具体目录优先，子目录规则不扩展到其他目录。\n<project_instructions>\n${body}\n</project_instructions>`;
 }
 
 /** 解析 SKILL.md 的 YAML frontmatter（简单 key: value 行，支持折行续写），只取 name/description。 */

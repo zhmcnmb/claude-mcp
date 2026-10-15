@@ -2,15 +2,20 @@
 //（GET /sse 拿 endpoint 事件 -> POST /messages 收发 JSON-RPC）。
 import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, unlinkSync, symlinkSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { testShell } from './shell-test.mjs';
 import { loadAgentsFiles } from './skills.ts';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const port = 18765;
-const testDir = mkdtempSync(path.join(tmpdir(), 'claude-local-test-'));
+const testRoot = path.resolve(here, '../temp/mcp-tests');
+mkdirSync(testRoot, { recursive: true });
+const testDir = mkdtempSync(path.join(testRoot, 'run-'));
 const ws = path.join(testDir, 'project', 'workspace 中文');
 const parentRules = '# Test parent rules\nPARENT_RULE_BODY\n';
 const workspaceRules = '# Test project rules\nWORKSPACE_RULE_BODY\n';
@@ -26,10 +31,18 @@ writeFileSync(
 );
 writeFileSync(path.join(testDir, 'AGENTS.md'), '\uFEFF' + parentRules);
 writeFileSync(path.join(ws, 'AGENTS.md'), workspaceRules);
+const ponytailDirectory = path.join(testDir, 'ponytail');
+const ponytailInstructions = path.join(ponytailDirectory, 'hooks', 'ponytail-instructions.js');
+mkdirSync(path.dirname(ponytailInstructions), { recursive: true });
+writeFileSync(path.join(ponytailDirectory, 'package.json'), '{"type":"commonjs"}');
+writeFileSync(path.join(ponytailDirectory, 'hooks', 'ponytail-config.js'), 'exports.getDefaultMode = () => "full";');
+writeFileSync(ponytailInstructions, 'exports.getPonytailInstructions = () => "PONYTAIL_TEST_V1";');
 
 const executable = process.env.CLAUDE_LOCAL_TEST_EXECUTABLE;
-const child = spawn(executable || process.execPath, [...(executable ? ['--server'] : [path.join(here, 'server.ts')]), ws, '--port', String(port)], {
+const child = spawn(executable || process.execPath, [...(executable ? ['--server', '--self-test'] : [path.join(here, 'server.ts')]), ws, '--port', String(port)], {
   stdio: ['ignore', 'pipe', 'pipe'],
+  windowsHide: true,
+  env: { ...process.env, PONYTAIL_DIR: ponytailDirectory, PONYTAIL_MODE: 'full', CLAUDE_LOCAL_TEST_DIR: path.join(testDir, 'electron-profile') },
 });
 process.once('exit', () => {
   child.kill();
@@ -124,25 +137,8 @@ const init = await rpc('initialize', {
   clientInfo: { name: 'self-check', version: '0.0.0' },
 });
 assert.equal(init.result.serverInfo.name, 'claude-local');
-assert.match(init.result.instructions, /demo-skill/, 'instructions carry the skills catalog');
-assert.ok(init.result.instructions.includes(parentRules), 'instructions 预加载父级规则全文并去除 BOM');
-assert.ok(init.result.instructions.includes(workspaceRules), 'instructions 预加载工作区规则全文');
-assert.ok(
-  init.result.instructions.indexOf(parentRules) < init.result.instructions.indexOf(workspaceRules),
-  '规则按父级到工作区的顺序排列',
-);
-assert.match(init.result.instructions, /<project_instructions>/, '项目规则与技能目录分开');
-assert.ok(!init.result.instructions.includes('# Demo'), '技能正文仍按需读取');
+assert.equal(init.result.instructions, undefined, '网页不消费初始化规则，不能重复交付全文');
 const globalAgentsPath = path.join(homedir(), '.pi', 'agent', 'AGENTS.md');
-try {
-  const globalRules = readFileSync(globalAgentsPath, 'utf8').replace(/^\uFEFF/, '');
-  assert.ok(init.result.instructions.includes(globalRules), 'instructions 预加载 Pi 全局规则全文');
-  assert.ok(init.result.instructions.indexOf(globalRules) < init.result.instructions.indexOf(parentRules));
-  const globalFiles = await loadAgentsFiles(path.dirname(globalAgentsPath));
-  assert.equal(globalFiles.filter((file) => file.path === globalAgentsPath).length, 1, '全局和祖先规则去重');
-} catch (e) {
-  if (e.code !== 'ENOENT') throw e;
-}
 const ack = await fetch(messagesUrl, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
@@ -160,6 +156,19 @@ const readTool = list.result.tools.find((t) => t.name === 'read');
 assert.ok(readTool?.description.includes('demo-skill'), 'read 工具描述携带 skills catalog');
 assert.ok(readTool?.description.includes('WORKSPACE_RULE_BODY'), 'read 工具描述集中注入工作区规则全文');
 assert.ok(!readTool?.description.includes('dingtalk-calendar'), '钉钉相关技能已成功排除');
+assert.ok(readTool.description.includes(parentRules), 'read 描述提供父级规则全文并去除 BOM');
+assert.ok(readTool.description.includes(workspaceRules), 'read 描述提供工作区规则全文');
+assert.ok(readTool.description.indexOf(parentRules) < readTool.description.indexOf(workspaceRules));
+assert.match(readTool.description, /<project_instructions>/);
+assert.ok(!readTool.description.includes('# Demo'), '技能正文仍按需读取');
+assert.match(readTool.description, /PONYTAIL_TEST_V1/, '源码与打包入口都必须加载 Ponytail');
+try {
+  const globalRules = readFileSync(globalAgentsPath, 'utf8').replace(/^\uFEFF/, '');
+  assert.ok(readTool.description.includes(globalRules), '个人通用规则仍完整保留');
+  assert.ok(readTool.description.indexOf(globalRules) < readTool.description.indexOf(parentRules));
+  const globalFiles = await loadAgentsFiles(path.dirname(globalAgentsPath));
+  assert.equal(globalFiles.filter((file) => file.isGlobal).length, 1, '全局和祖先规则去重');
+} catch (e) { if (e.code !== 'ENOENT') throw e; }
 
 const otherTools = list.result.tools.filter((t) => t.name !== 'read');
 assert.ok(
@@ -186,6 +195,7 @@ assert.equal(readSlice.content[0].text, '2: beta\n[已截断 — 共 3 行，用
 await toolCall('edit', { path: 'sub/dir/hello.txt', oldText: 'beta', newText: 'BETA' });
 assert.equal(readFileSync(path.join(ws, 'sub/dir/hello.txt'), 'utf8'), 'alpha\nBETA\ngamma\n');
 writeFileSync(path.join(ws, 'dup.txt'), 'x x');
+await toolCall('read', { path: 'dup.txt' });
 const dup = await toolCall('edit', { path: 'dup.txt', oldText: 'x', newText: 'y' });
 assert.ok(dup.isError && /匹配到 2 处/.test(dup.content[0].text), '非唯一 oldText 被拒绝');
 const missing = await toolCall('edit', { path: 'dup.txt', oldText: 'zzz', newText: 'y' });
@@ -235,6 +245,153 @@ const overlap = await toolCall('edit', {
 });
 assert.ok(overlap.isError && /重叠/.test(overlap.content[0].text), '重叠的批量编辑被拒绝');
 
+// --- 参数校验不能把缺少 content/newText 当成删除指令 ---
+const resultText = (result) => result.content.filter((item) => item.type === 'text').map((item) => item.text).join('\n');
+const assertError = (result, pattern) => { assert.ok(result.isError, resultText(result)); assert.match(resultText(result), pattern); };
+writeFileSync(path.join(ws, 'protected.txt'), 'KEEP\n');
+await toolCall('read', { path: 'protected.txt' });
+for (const [name, args] of [
+  ['write', { path: 'protected.txt' }],
+  ['write', { path: 'protected.txt', content: null }],
+  ['edit', { path: 'protected.txt', oldText: 'KEEP' }],
+  ['edit', { path: 'protected.txt', edits: [{ oldText: 'KEEP' }] }],
+  ['edit', { path: 'protected.txt', oldText: '', newText: 'x' }],
+  ['edit', { path: 'protected.txt', oldText: 'KEEP', newText: 'x', edits: [] }],
+  ['read', { path: 'protected.txt', offset: 1.5 }],
+  ['bash', { command: 'echo ignored', timeout: -1 }],
+  ['write', { path: 'protected.txt', content: 'oops', typo: true }],
+]) {
+  assert.ok((await toolCall(name, args)).isError, `${name} 必须拒绝无效参数`);
+  assert.equal(readFileSync(path.join(ws, 'protected.txt'), 'utf8'), 'KEEP\n');
+}
+
+// --- 原编码/BOM/行尾按字节保留，不可表示的新字符必须拒绝 ---
+const fixtures = [
+  ['utf8', Buffer.from('alpha=1\r\n中文\r\n'), Buffer.from('alpha=2\r\n中文\r\n')],
+  ['utf8-bom', Buffer.from('\ufeffalpha=1\r\n中文\r\n'), Buffer.from('\ufeffalpha=2\r\n中文\r\n')],
+  ['gbk', Buffer.from('616c7068613d310d0ad6d0cec40d0a', 'hex'), Buffer.from('616c7068613d320d0ad6d0cec40d0a', 'hex')],
+  ['utf16le', Buffer.from('\ufeffalpha=1\r\n中文\r\n', 'utf16le'), Buffer.from('\ufeffalpha=2\r\n中文\r\n', 'utf16le')],
+  ['utf16be', Buffer.from('\ufeffalpha=1\r\n中文\r\n', 'utf16le').swap16(), Buffer.from('\ufeffalpha=2\r\n中文\r\n', 'utf16le').swap16()],
+];
+for (const [name, before, after] of fixtures) {
+  const file = `${name}.txt`;
+  writeFileSync(path.join(ws, file), before);
+  assert.match(resultText(await toolCall('read', { path: file })), /中文/);
+  const result = await toolCall('edit', { path: file, oldText: 'alpha=1\n中文', newText: 'alpha=2\n中文' });
+  assert.ok(!result.isError, resultText(result));
+  assert.deepEqual(readFileSync(path.join(ws, file)), after, `${name} 局部编辑保留字节格式`);
+  const overwritten = await toolCall('write', { path: file, content: 'alpha=1\n中文\n' });
+  assert.ok(!overwritten.isError, resultText(overwritten));
+  assert.deepEqual(readFileSync(path.join(ws, file)), before, `${name} 整体覆盖保留格式`);
+}
+const badCharacter = await toolCall('edit', { path: 'gbk.txt', oldText: 'alpha=1', newText: 'emoji=😀' });
+assertError(badCharacter, /无法.*无损保存/);
+assert.deepEqual(readFileSync(path.join(ws, 'gbk.txt')), fixtures[2][1]);
+for (const bytes of [Buffer.from([0xff]), Buffer.from([0xff, 0xfe, 0x61]), Buffer.from([0, 1, 2, 3]), Buffer.from([0xff, 0xfe, 0, 0])]) {
+  writeFileSync(path.join(ws, 'invalid-encoding.txt'), bytes);
+  assert.ok((await toolCall('read', { path: 'invalid-encoding.txt' })).isError);
+  assert.ok((await toolCall('write', { path: 'invalid-encoding.txt', content: 'replace' })).isError);
+  assert.deepEqual(readFileSync(path.join(ws, 'invalid-encoding.txt')), bytes);
+}
+const mixed = 'a=1\r\nb=2\nc=3\r\nd=4';
+writeFileSync(path.join(ws, 'mixed.txt'), mixed);
+await toolCall('read', { path: 'mixed.txt' });
+assert.ok(!(await toolCall('edit', { path: 'mixed.txt', oldText: 'a=1', newText: 'a=9\ninsert=1' })).isError);
+assert.equal(readFileSync(path.join(ws, 'mixed.txt'), 'utf8'), 'a=9\r\ninsert=1\r\nb=2\nc=3\r\nd=4');
+assertError(await toolCall('write', { path: 'mixed.txt', content: 'all\nchanged\n' }), /混合行尾/);
+writeFileSync(path.join(ws, 'crlf-offsets.txt'), 'start\r\nA😀=1\r\nB=2\r\nend');
+await toolCall('read', { path: 'crlf-offsets.txt' });
+assert.ok(!(await toolCall('edit', { path: 'crlf-offsets.txt', edits: [
+  { oldText: 'A😀=1\nB=2', newText: 'A😀=9\nB=8' },
+  { oldText: 'end', newText: 'last\nline' },
+] })).isError);
+assert.equal(readFileSync(path.join(ws, 'crlf-offsets.txt'), 'utf8'), 'start\r\nA😀=9\r\nB=8\r\nlast\r\nline');
+writeFileSync(path.join(ws, 'ambiguous.txt'), 'aaa');
+await toolCall('read', { path: 'ambiguous.txt' });
+assertError(await toolCall('edit', { path: 'ambiguous.txt', oldText: 'aa', newText: 'x' }), /匹配到 2 处/);
+
+// --- 未读/过期快照拒绝覆盖；并发请求不能覆盖另一个请求的结果 ---
+writeFileSync(path.join(ws, 'unread.txt'), 'original');
+assertError(await toolCall('read', { path: 'unread.txt', offset: 100 }), /超出文件范围/);
+assertError(await toolCall('write', { path: 'unread.txt', content: 'lost' }), /先用 read/);
+assertError(await toolCall('edit', { path: 'unread.txt', oldText: 'original', newText: 'lost' }), /先用 read/);
+await toolCall('read', { path: 'unread.txt' });
+writeFileSync(path.join(ws, 'unread.txt'), 'original\nexternal');
+assertError(await toolCall('edit', { path: 'unread.txt', oldText: 'original', newText: 'lost' }), /已变化/);
+assertError(await toolCall('write', { path: 'unread.txt', content: 'lost' }), /已变化/);
+assert.equal(readFileSync(path.join(ws, 'unread.txt'), 'utf8'), 'original\nexternal');
+unlinkSync(path.join(ws, 'unread.txt'));
+assertError(await toolCall('write', { path: 'unread.txt', content: 'resurrect' }), /已变化/);
+assert.ok(!existsSync(path.join(ws, 'unread.txt')));
+
+const second = new Client({ name: 'second-session', version: '1' });
+await second.connect(new SSEClientTransport(new URL(`http://127.0.0.1:${port}/sse`)));
+await second.listTools();
+try {
+  assertError(await second.callTool({ name: 'write', arguments: { path: 'protected.txt', content: 'lost' } }), /先用 read/);
+  writeFileSync(path.join(ws, 'concurrent.txt'), 'a=1\nb=1\n');
+  await toolCall('read', { path: 'concurrent.txt' });
+  await second.callTool({ name: 'read', arguments: { path: 'concurrent.txt' } });
+  const concurrent = await Promise.all([
+    toolCall('edit', { path: 'concurrent.txt', oldText: 'a=1', newText: 'a=2' }),
+    second.callTool({ name: 'edit', arguments: { path: 'concurrent.txt', oldText: 'b=1', newText: 'b=2' } }),
+  ]);
+  assert.equal(concurrent.filter((result) => result.isError).length, 1, '两个快照只能有一个先写成功');
+  assert.match(readFileSync(path.join(ws, 'concurrent.txt'), 'utf8'), /^(a=2\nb=1|a=1\nb=2)\n$/);
+} finally { await second.close(); }
+writeFileSync(path.join(ws, 'same-session.txt'), 'a=1\nb=1\n');
+await toolCall('read', { path: 'same-session.txt' });
+const sameSession = await Promise.all([
+  toolCall('edit', { path: 'same-session.txt', oldText: 'a=1', newText: 'a=2' }),
+  toolCall('edit', { path: 'same-session.txt', oldText: 'b=1', newText: 'b=2' }),
+]);
+assert.equal(sameSession.filter((result) => result.isError).length, 1, '同连接并发调用也使用请求开始时的快照');
+
+// --- 子目录规则、热更新和命令 cwd：规则交付不应先执行副作用 ---
+mkdirSync(path.join(ws, 'nested'));
+const nestedRules = path.join(ws, 'nested', 'AGENTS.md');
+writeFileSync(nestedRules, '# Nested\nNESTED_RULE_V1\n');
+const versionOf = (result) => resultText(result).match(/contextVersion: ([a-f0-9]{64})/)?.[1];
+const nestedWrite = { path: 'nested/new.txt', content: 'a=1\n' };
+const gated = await toolCall('write', nestedWrite);
+assertError(gated, /CONTEXT_REQUIRED/);
+assert.match(resultText(gated), /NESTED_RULE_V1/);
+assert.ok(!existsSync(path.join(ws, 'nested', 'new.txt')));
+assertError(await toolCall('write', nestedWrite), /CONTEXT_REQUIRED/);
+const nestedVersion = versionOf(gated);
+assert.ok(nestedVersion);
+assert.ok(!(await toolCall('write', { ...nestedWrite, contextVersion: nestedVersion })).isError);
+writeFileSync(nestedRules, '# Nested\nNESTED_RULE_V2\n');
+const updated = await toolCall('read', { path: 'nested/new.txt' });
+assert.match(resultText(updated), /NESTED_RULE_V2/);
+assert.ok(!(resultText(await toolCall('read', { path: 'nested/new.txt' })).includes('NESTED_RULE_V2')), '相同连接/版本不重复附加正文');
+assertError(await toolCall('edit', { path: 'nested/new.txt', oldText: 'a=1', newText: 'a=2', contextVersion: nestedVersion }), /CONTEXT_REQUIRED/);
+assert.ok(!(await toolCall('edit', { path: 'nested/new.txt', oldText: 'a=1', newText: 'a=2', contextVersion: versionOf(updated) })).isError);
+symlinkSync(path.join(ws, 'nested'), path.join(ws, 'alias'), 'junction');
+await toolCall('read', { path: 'alias/new.txt' });
+writeFileSync(path.join(ws, 'nested', 'new.txt'), 'a=3\n');
+assertError(await toolCall('edit', { path: 'nested/new.txt', oldText: 'a=3', newText: 'lost', contextVersion: versionOf(updated) }), /已变化/);
+await toolCall('read', { path: 'nested/new.txt' });
+assert.ok(!(await toolCall('edit', { path: 'alias/new.txt', oldText: 'a=3', newText: 'a=4', contextVersion: versionOf(updated) })).isError, '路径别名共享真实文件的读取版本和目录规则');
+const commandArgs = { cwd: 'nested', command: 'node -e "require(\'fs\').writeFileSync(\'marker.txt\',\'ok\')"' };
+assertError(await toolCall('bash', commandArgs), /CONTEXT_REQUIRED/);
+assert.ok(!existsSync(path.join(ws, 'nested', 'marker.txt')));
+assert.match(resultText(await toolCall('bash', { ...commandArgs, contextVersion: versionOf(updated) })), /exitCode: 0/);
+assert.equal(readFileSync(path.join(ws, 'nested', 'marker.txt'), 'utf8'), 'ok');
+unlinkSync(nestedRules);
+const removed = await toolCall('read', { path: 'nested/new.txt' });
+assert.ok(!resultText(removed).includes('NESTED_RULE_V2'), '删除的规则不继续交付');
+writeFileSync(path.join(ws, 'AGENTS.md'), workspaceRules + 'WORKSPACE_RULE_UPDATED\n');
+const hot = await toolCall('read', { path: 'protected.txt' });
+assert.match(resultText(hot), /WORKSPACE_RULE_UPDATED/, '无需 tools/list 即可收到规则变更');
+assertError(await toolCall('write', { path: 'protected.txt', content: '' }), /CONTEXT_REQUIRED/);
+assert.ok(!(await toolCall('write', { path: 'protected.txt', content: '', contextVersion: versionOf(hot) })).isError, '明确的空字符串仍可用于清空');
+assert.equal(readFileSync(path.join(ws, 'protected.txt'), 'utf8'), '');
+writeFileSync(ponytailInstructions, 'exports.getPonytailInstructions = () => "PONYTAIL_TEST_V2";');
+const ponytailUpdated = await toolCall('read', { path: 'protected.txt' });
+assert.match(resultText(ponytailUpdated), /PONYTAIL_TEST_V2/, '运行期间变更 Ponytail 正文不能被 require 缓存掩盖');
+assert.ok(!resultText(ponytailUpdated).includes('PONYTAIL_TEST_V1'));
+
 // --- skill 热重扫：启动后新增的 skill 必须出现在新的 tools/list 里 ---
 mkdirSync(path.join(ws, '.pi', 'skills', 'late-skill'), { recursive: true });
 writeFileSync(path.join(ws, '.pi', 'skills', 'late-skill', 'SKILL.md'), '---\nname: late-skill\ndescription: Added after startup.\n---\n');
@@ -250,6 +407,20 @@ const big = 'x'.repeat(5 * 1024 * 1024);
 const bigWrite = await toolCall('write', { path: 'big.txt', content: big });
 assert.ok(!bigWrite.isError, '超过 4MB 的 Write 请求体不被拒绝');
 assert.equal(readFileSync(path.join(ws, 'big.txt'), 'utf8').length, big.length);
+
+// --- replaceAll 与编辑反馈 ---
+await toolCall('write', { path: 'replace-all.txt', content: '中文 target\r\n中文 target\r\n' });
+assertError(await toolCall('edit', { path: 'replace-all.txt', oldText: 'target', newText: 'done' }), /2 处/);
+const all = await toolCall('edit', { path: 'replace-all.txt', oldText: 'target', newText: 'done', replaceAll: true });
+assert.match(resultText(all), /2 处/);
+assert.match(resultText(all), /1: 中文 done/);
+assert.equal(readFileSync(path.join(ws, 'replace-all.txt'), 'utf8'), '中文 done\r\n中文 done\r\n');
+await toolCall('write', { path: 'overlap-all.txt', content: 'aaa' });
+assertError(await toolCall('edit', { path: 'overlap-all.txt', oldText: 'aa', newText: 'b', replaceAll: true }), /重叠/);
+assert.equal(readFileSync(path.join(ws, 'overlap-all.txt'), 'utf8'), 'aaa');
+assertError(await toolCall('edit', { path: 'replace-all.txt', oldText: '中文 done\nmissing', newText: 'x' }), /候选位置/);
+
+await testShell(toolCall, ws, `http://127.0.0.1:${port}/sse`);
 
 // --- 规则文件不可读取时必须报错，不能静默跳过 ---
 const invalidRulesDir = path.join(testDir, 'invalid-rules');

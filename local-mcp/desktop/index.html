@@ -17,18 +17,27 @@
       <label for="url">服务 URL</label>
       <input id="url" type="url" value="http://127.0.0.1:8765/sse" spellcheck="false" autocomplete="off" aria-describedby="url-help">
       <p id="url-help" class="hint">可修改本机地址、端口和路径，例如 http://127.0.0.1:9000/sse。</p>
+      <div class="shell-settings">
+        <label for="shellPath">Shell 路径（留空使用系统默认）</label>
+        <input id="shellPath" list="shell-options" placeholder="Windows 默认 cmd.exe；可选择 Git Bash 或 PowerShell" spellcheck="false" autocomplete="off" aria-describedby="shell-help">
+        <datalist id="shell-options"><option value="C:\Program Files\Git\bin\bash.exe">Git Bash</option><option value="powershell.exe">Windows PowerShell</option><option value="pwsh.exe">PowerShell 7</option><option value="cmd.exe">Windows cmd</option><option value="/bin/zsh">macOS zsh</option></datalist>
+        <p id="shell-help" class="hint">切换后使用对应 Shell 的命令语法。Windows 的 WSL bash 入口不用于本地命令。</p>
+        <label for="rgPath">ripgrep 路径（留空自动查找）</label>
+        <input id="rgPath" placeholder="rg.exe 或 rg 的完整路径" spellcheck="false" autocomplete="off">
+        <p id="environment" class="hint" role="status"></p>
+      </div>
       <div class="actions"><button id="start" class="primary">启动服务</button><button id="stop" disabled>停止服务</button><span id="saved">启动成功后自动保存设置</span></div>
       <p id="error" role="alert" hidden></p>
     </section>
     <section class="card connection" aria-label="浏览器扩展连接">
-      <div><h2>浏览器扩展连接地址</h2><p>将此地址填入扩展的 URL 字段。修改地址后，请同步更新扩展。</p><code id="connection-url">http://127.0.0.1:8765/sse</code></div><button id="copy" disabled>复制 URL</button>
+      <div><h2>浏览器扩展连接地址</h2><p>将此地址填入扩展的 URL 字段。修改地址后，请同步修改扩展中的 URL。</p><code id="connection-url">http://127.0.0.1:8765/sse</code></div><button id="copy" disabled>复制 URL</button>
     </section>
     <section class="card log-card"><h2>运行日志</h2><pre id="logs" aria-label="运行日志">服务尚未启动。</pre></section>
     <footer>仅接受本机连接 · 隐藏到托盘后服务继续运行</footer>
   </main>
   <dialog id="close-dialog" aria-labelledby="close-title" aria-describedby="close-description">
     <h2 id="close-title">关闭窗口</h2>
-    <p id="close-description">隐藏到托盘后，服务继续运行。退出程序将停止服务。</p>
+    <p id="close-description">隐藏到托盘后，服务继续运行。退出程序将停止服务及正在运行的命令任务。</p>
     <div class="actions">
       <button id="close-cancel" autofocus>取消</button>
       <button id="close-hide" class="primary">隐藏到托盘</button>

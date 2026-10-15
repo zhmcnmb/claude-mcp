@@ -1,9 +1,12 @@
 import http from 'node:http';
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { getWorkspace, setWorkspace, toolDefs } from './tools.ts';
+import { contentHash, fail, resolveToolPath, toolDefs, validateToolArgs } from './tools.ts';
+import type { ToolResult, ToolSession } from './tools.ts';
+import { createShell } from './shell.ts';
 import {
   formatAgentsInstructions,
   formatSkillsCatalog,
@@ -12,68 +15,90 @@ import {
   scanSkills,
   skillSources,
 } from './skills.ts';
-export async function startServer({ workspace, host = '127.0.0.1', port = 8765, endpoint = '/sse', onLog = console.error }: {
+export async function startServer({ workspace, host = '127.0.0.1', port = 8765, endpoint = '/sse', shellPath, rgPath, onLog = console.error }: {
   workspace: string;
   host?: string;
   port?: number;
   endpoint?: string;
+  shellPath?: string;
+  rgPath?: string;
   onLog?: (message: string) => void;
 }) {
   const log = (message: string) => onLog(`[${new Date().toISOString()}] ${message}`);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error(`无效端口：${port}`);
   if (!(await fs.stat(workspace)).isDirectory()) throw new Error(`工作区不是目录：${workspace}`);
-  setWorkspace(workspace);
-  const skills = await scanSkills(getWorkspace());
-  const agentsFiles = await loadAgentsFiles(getWorkspace());
-  const ponytailInstructions = await loadPonytailInstructions();
-  const startupCatalog = formatSkillsCatalog(skills);
-  const startupInstructions = [
-    formatAgentsInstructions(agentsFiles),
-    ponytailInstructions,
-    startupCatalog,
-  ].filter(Boolean).join('\n\n');
-  let lastInstructions = startupInstructions;
+  workspace = await fs.realpath(workspace);
+  const shell = await createShell(workspace, shellPath, rgPath);
+  const skills = await scanSkills(workspace);
+  const agentsFiles = await loadAgentsFiles(workspace);
 
-  /** 每次 tools/list 都重新扫描，服务运行期间新增的 skill 或规则变更无需重启即可生效。 */
-  async function currentInstructions(): Promise<string> {
+  async function currentContext(directory: string) {
     const [scannedSkills, scannedAgents, scannedPonytail] = await Promise.all([
-      scanSkills(getWorkspace()),
-      loadAgentsFiles(getWorkspace()),
+      scanSkills(workspace),
+      loadAgentsFiles(directory),
       loadPonytailInstructions(),
     ]);
     const catalog = formatSkillsCatalog(scannedSkills);
     const agents = formatAgentsInstructions(scannedAgents);
-    return [agents, scannedPonytail, catalog].filter(Boolean).join('\n\n');
+    const instructions = [
+      '运行环境：本地 MCP 服务，不加载 Pi 的自动改写等客户端扩展；不要把其他客户端的扩展状态当作本服务已启用。',
+      agents, scannedPonytail, catalog,
+    ].filter(Boolean).join('\n\n');
+    return { instructions, version: contentHash(instructions) };
   }
 
   function buildServer(): Server {
+    const session: ToolSession = { workspace, shell, reads: new Map() };
+    let listedVersion: string | undefined;
+    let deliveredVersion: string | undefined;
     const server = new Server(
       { name: 'claude-local', version: '0.1.0' },
-      { capabilities: { tools: {} }, instructions: startupInstructions },
+      // Claude 网页不消费 initialize.instructions；正文只从工具描述和工具结果交付。
+      { capabilities: { tools: {} } },
     );
     server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const instructions = await currentInstructions();
-      if (instructions !== lastInstructions) {
-        lastInstructions = instructions;
-        server.notification({ method: 'notifications/tools/list_changed' }).catch(() => {});
-      }
+      const context = await currentContext(workspace);
+      listedVersion = context.version;
+      deliveredVersion = context.version;
       log(`tools/list 被调用，返回 ${toolDefs.length} 个工具`);
       return {
         tools: toolDefs.map(({ handler, ...def }) => ({
           ...def,
-          description: def.name === 'read' ? `${def.description}\n\n${instructions}` : def.description,
+          description: def.name === 'read' ? `${def.description}\n\n规则版本 contextVersion: ${context.version}\n${context.instructions}` : def.name === 'bash' ? `${def.description}\n\n${shell.environment}` : def.description,
         })),
       };
     });
     server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const def = toolDefs.find((t) => t.name === req.params.name);
       const start = Date.now();
-      let result;
-      if (!def) {
-        result = { content: [{ type: 'text' as const, text: `未知工具：${req.params.name}` }], isError: true };
+      const readVersions = new Map(session.reads);
+      let result: ToolResult;
+      const error = validateToolArgs(req.params.name, req.params.arguments);
+      if (error || !def) {
+        result = fail(error ?? `未知工具：${req.params.name}`);
+      } else if (def.name === 'bash' && ['list', 'output', 'stop'].includes(String(req.params.arguments?.action))) {
+        // 查询和取消不启动新命令，规则更新不能阻塞用户停止正在运行的任务。
+        try { result = await def.handler(req.params.arguments as never, session); }
+        catch (e: any) { result = fail(String(e?.message ?? e)); }
       } else {
         try {
-          result = await def.handler(req.params.arguments as never);
+          const args = req.params.arguments!;
+          const target = await resolveToolPath(workspace, String(def.name === 'bash' ? args.cwd ?? '.' : args.path));
+          const directory = def.name === 'bash' ? target : path.dirname(target);
+          const context = await currentContext(directory);
+          const contextText = `适用目录：${directory}\n规则版本 contextVersion: ${context.version}\n以下正文替代该作用域的旧版本；其他目录仍按各自范围适用。\n${context.instructions}`;
+          // 动态规则须由模型在下一次调用回传版本，防止同批并发写入越过规则交付。
+          if (def.name !== 'read' && args.contextVersion !== context.version
+            && (context.version !== listedVersion || args.contextVersion !== undefined)) {
+            deliveredVersion = context.version;
+            result = fail(`CONTEXT_REQUIRED：本次操作尚未执行。先遵循下面的规则，再携带 contextVersion 重试原操作，无需请求用户确认。\n\n${contextText}`);
+          } else {
+            const includeContext = def.name === 'read' && context.version !== deliveredVersion;
+            result = await def.handler(args as never, { ...session, readVersions });
+            if (includeContext) result.content.unshift({ type: 'text', text: contextText });
+            else if (def.name === 'read' && context.version !== listedVersion) result.content.push({ type: 'text', text: `适用目录：${directory}\ncontextVersion: ${context.version}` });
+            deliveredVersion = context.version;
+          }
         } catch (e: any) {
           result = { content: [{ type: 'text' as const, text: String(e?.message ?? e) }], isError: true };
         }
@@ -168,13 +193,14 @@ export async function startServer({ workspace, host = '127.0.0.1', port = 8765, 
 
   const addressHost = host.includes(':') ? `[${host}]` : host;
   const serviceUrl = `http://${addressHost}:${port}${endpoint}`;
-  const sources = skillSources(getWorkspace());
+  const sources = skillSources(workspace);
   log(
     [
       'Claude Local MCP',
       '',
-      `工作区: ${getWorkspace()}`,
+      `工作区: ${workspace}`,
       '工具: read, write, edit, bash',
+      shell.environment,
       `Skill 来源:${sources.map((s) => `\n  - ${s}`).join('')}`,
       `发现 skills: ${skills.length}${skills.length ? `（${skills.map((s) => s.name).join(', ')}）` : ''}`,
       `AGENTS.md（已加载）: ${agentsFiles.length ? agentsFiles.map((file) => file.path).join(', ') : '（无）'}`,
@@ -185,8 +211,10 @@ export async function startServer({ workspace, host = '127.0.0.1', port = 8765, 
   );
   return {
     url: serviceUrl,
-    workspace: getWorkspace(),
+    workspace,
+    environment: shell.environment,
     async stop() {
+      await shell.close();
       await Promise.all([...transports.values()].map((transport) => transport.close()));
       httpServer.closeAllConnections();
       await new Promise<void>((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));

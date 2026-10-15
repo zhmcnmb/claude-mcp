@@ -18,10 +18,11 @@ else app.whenReady().then(async () => {
     return;
   }
   const configFile = path.join(app.getPath('userData'), 'settings.json');
-  let state = { workspace: '', url: 'http://127.0.0.1:8765/sse', status: 'stopped', logs: [] };
+  let state = { workspace: '', url: 'http://127.0.0.1:8765/sse', shellPath: '', rgPath: '', environment: '', status: 'stopped', logs: [] };
   try {
     const saved = JSON.parse(await readFile(configFile, 'utf8'));
     if (typeof saved.workspace === 'string') state.workspace = saved.workspace;
+    for (const key of ['shellPath', 'rgPath']) if (typeof saved[key] === 'string') state[key] = saved[key];
     if (typeof saved.url === 'string') state.url = saved.url;
   } catch (error) {
     if (error.code !== 'ENOENT') state.logs.push(`读取设置失败：${error.message}`);
@@ -37,7 +38,7 @@ else app.whenReady().then(async () => {
   let service;
   let quitting = false;
   const window = new BrowserWindow({
-    width: 860, height: 720, minWidth: 640, minHeight: 600,
+    width: 860, height: 900, minWidth: 640, minHeight: 600,
     title: 'Claude Local MCP', icon: path.join(__dirname, 'icon.png'), backgroundColor: '#f5f6f8', autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   });
@@ -74,7 +75,8 @@ else app.whenReady().then(async () => {
     if (state.status !== 'running') return;
     state.status = 'stopping'; publish();
     try { await service.stop(); }
-    finally { service = undefined; state.status = 'stopped'; publish(); }
+    catch (error) { state.status = 'running'; publish(); throw error; }
+    service = undefined; state.status = 'stopped'; publish();
     log('服务已停止。');
   }
   const handle = (name, handler) => ipcMain.handle(name, async (event, ...args) => {
@@ -94,7 +96,8 @@ else app.whenReady().then(async () => {
       const settings = await validateSettings(input);
       service = await startServer({ ...settings, onLog: log });
       await mkdir(path.dirname(configFile), { recursive: true });
-      await writeFile(configFile, JSON.stringify({ workspace: settings.workspace, url: settings.url }, null, 2) + '\n', 'utf8');
+      await writeFile(configFile, JSON.stringify({ workspace: settings.workspace, url: settings.url, shellPath: settings.shellPath, rgPath: settings.rgPath }, null, 2) + '\n', 'utf8');
+      state.shellPath = settings.shellPath; state.rgPath = settings.rgPath; state.environment = service.environment;
       state.workspace = settings.workspace; state.url = service.url; state.status = 'running'; publish();
       log(`服务已启动：${service.url}`);
       return state;
@@ -120,7 +123,7 @@ else app.whenReady().then(async () => {
       setTimeout(() => app.quit(), 100);
       return;
     }
-    stop().catch((error) => log(error.message)).finally(() => { quitting = true; app.quit(); });
+    stop().then(() => { quitting = true; app.quit(); }).catch((error) => log(`未退出：${error.message}`));
   });
   app.on('window-all-closed', () => app.quit());
   app.on('will-quit', () => tray.destroy());

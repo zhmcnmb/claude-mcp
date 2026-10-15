@@ -18,7 +18,10 @@ async function validateSettings(input) {
   if (!info.isDirectory()) throw new Error('工作区必须是文件夹。');
   const port = Number(url.port || 80);
   if (port < 1 || port > 65535) throw new Error('端口必须在 1–65535 之间。');
-  return { workspace, url: url.href, host, port, endpoint: url.pathname };
+  for (const key of ['shellPath', 'rgPath']) {
+    if (input[key] !== undefined && (typeof input[key] !== 'string' || input[key].includes('\0'))) throw new Error(`${key} 必须是有效路径。`);
+  }
+  return { shellPath: input.shellPath?.trim() || '', rgPath: input.rgPath?.trim() || '', workspace, url: url.href, host, port, endpoint: url.pathname };
 }
 
 module.exports = { validateSettings };
